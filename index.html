@@ -186,7 +186,7 @@ for (const side of [-1, 1]) {
 }
 
 // --- Stands behind each wall, packed with a crowd (thin instances: thousands of people, two draw calls)
-const flags = [];
+const flags = [], banners = [], flagMats = {}; // flagMats: one painted material per coat of arms, shared by flags
 // Spectator: shouldered torso + arms, one mesh per pose (arms down / arms raised and cheering)
 // Crowd motion on the GPU: every spectator (body, head, hat) bounces at its own rhythm, seeded from its position,
 // so thousands of thin instances come alive for free. crowd.amp rises as the knights close and after a hit.
@@ -211,15 +211,28 @@ class CrowdBob extends BABYLON.MaterialPluginBase {
 }
 const crowdCloth = pbr("crowdCloth", [1, 1, 1], 0, 0.95);
 new CrowdBob(crowdCloth);
+// A spectator from the waist up (origin = torso centre, shoulders along ±z, facing ±x): chest, a tunic flaring
+// over the hips, neck, rounded shoulders, two-segment arms with hands. One merged mesh per pose.
 function makeFigure(name, cheering) {
-  const torso = BABYLON.MeshBuilder.CreateCylinder(name, { diameterTop: 0.44, diameterBottom: 0.3, height: 0.62, tessellation: 8 }, scene);
-  torso.scaling.x = 0.6;
-  const parts = [torso];
+  const parts = [];
+  const add = m => { parts.push(m); return m; };
+  const seg = (a, b, r) => { // capsule between two points
+    const d = b.subtract(a), c = add(BABYLON.MeshBuilder.CreateCapsule(name + "Seg", { radius: r, height: d.length() + 2 * r, tessellation: 6, subdivisions: 1 }, scene));
+    c.position = a.add(b).scale(0.5); c.rotationQuaternion = BABYLON.Quaternion.Identity();
+    BABYLON.Quaternion.FromUnitVectorsToRef(V3(0, 1, 0), d.normalize(), c.rotationQuaternion); return c;
+  };
+  const chest = add(BABYLON.MeshBuilder.CreateCylinder(name, { diameterTop: 0.44, diameterBottom: 0.34, height: 0.5, tessellation: 10 }, scene));
+  chest.position.y = 0.06; chest.scaling.x = 0.6;
+  const skirt = add(BABYLON.MeshBuilder.CreateCylinder(name + "Tunic", { diameterTop: 0.34, diameterBottom: 0.52, height: 0.34, tessellation: 10 }, scene));
+  skirt.position.y = -0.36; skirt.scaling.x = 0.7;
+  add(BABYLON.MeshBuilder.CreateCylinder(name + "Neck", { diameter: 0.1, height: 0.1, tessellation: 6 }, scene)).position.y = 0.34;
   for (const s of [-1, 1]) {
-    const arm = BABYLON.MeshBuilder.CreateCapsule(name + "Arm", { radius: 0.055, height: 0.6, tessellation: 6, subdivisions: 1 }, scene);
-    if (cheering) { arm.position.set(0, 0.52, s * 0.3); arm.rotation.x = s * 0.45; }
-    else { arm.position.set(0, -0.02, s * 0.25); arm.rotation.x = -s * 0.12; }
-    parts.push(arm);
+    add(BABYLON.MeshBuilder.CreateSphere(name + "Shoulder", { diameter: 0.15, segments: 4 }, scene)).position.set(0, 0.27, s * 0.2);
+    const sh = V3(0, 0.27, s * 0.22);
+    const el = cheering ? V3(0.02, 0.52, s * 0.33) : V3(0.02, 0.0, s * 0.26);
+    const ha = cheering ? V3(0.04, 0.78, s * 0.36) : V3(0.08, -0.2, s * 0.24);
+    seg(sh, el, 0.052); seg(el, ha, 0.045);
+    add(BABYLON.MeshBuilder.CreateSphere(name + "Hand", { diameter: 0.085, segments: 4 }, scene)).position = ha.add(ha.subtract(el).normalize().scale(0.05));
   }
   const m = BABYLON.Mesh.MergeMeshes(parts, true);
   m.name = name; m.material = crowdCloth;
@@ -270,7 +283,74 @@ for (const side of [-1, 1]) {
   const back = BABYLON.MeshBuilder.CreateBox("standBack", { width: 0.25, height: 1.6 + TIERS * TIER_RISE + 2, depth: LIST_LEN }, scene);
   back.position.set(side * (STAND_X + TIERS * TIER_D + 0.1), (1.6 + TIERS * TIER_RISE + 2) / 2, 0); back.material = standWood;
   for (let z = -TRACK_HALF; z <= TRACK_HALF; z += 14) flags.push(makeFlag(V3(side * (STAND_X + TIERS * TIER_D + 0.1), 1.6 + TIERS * TIER_RISE + 2, z), 4, side > 0 ? ARMS.player : ARMS.bot));
+  // Long heraldic banners hung above the back of the stands, facing the lists (between the flagpoles)
+  const backTop = 1.6 + TIERS * TIER_RISE + 2, arms = side > 0 ? ARMS.player : ARMS.bot;
+  const bannerMat = weave(painted("banner" + side, 128, 320, (g, w, h) => {
+    g.clearRect(0, 0, w, h); drawArms(arms)(g, w, h * 0.86);
+    g.fillStyle = arms.field; for (let x = 0; x < w; x += 32) { g.beginPath(); g.moveTo(x, h * 0.86); g.lineTo(x + 16, h); g.lineTo(x + 32, h * 0.86); g.fill(); }
+  }), "rough_linen", 1, 2.5, 0.6);
+  bannerMat.albedoTexture.hasAlpha = true; bannerMat.useAlphaFromAlbedoTexture = true; bannerMat.transparencyMode = BABYLON.Material.MATERIAL_ALPHATEST;
+  for (let z = -TRACK_HALF + 7; z <= TRACK_HALF; z += 14) {
+    const b = BABYLON.MeshBuilder.CreatePlane("standBanner", { width: 1.1, height: 2.8, sideOrientation: BABYLON.Mesh.DOUBLESIDE }, scene);
+    b.position.set(side * (STAND_X + TIERS * TIER_D - 0.1), backTop + 0.4 - 1.4, z); b.rotation.y = side * Math.PI / 2; b.material = bannerMat;
+    b.phase = Math.random() * 6; banners.push(b);
+    const bar = BABYLON.MeshBuilder.CreateCylinder("bannerBar", { diameter: 0.06, height: 1.3, tessellation: 6 }, scene);
+    bar.rotation.x = Math.PI / 2; bar.position.set(b.position.x, backTop + 0.42, z); bar.material = darkWood;
+  }
 }
+
+// --- People on the ground: groundlings behind rope barriers at both ends, squires by the lance racks, marshals.
+// Same torso/head/headwear thin instances as the stands, plus legs.
+const hose = [[0.15, 0.12, 0.1], [0.3, 0.22, 0.15], [0.12, 0.14, 0.2], [0.35, 0.1, 0.08], [0.25, 0.25, 0.22]];
+const legsMesh = BABYLON.Mesh.MergeMeshes([-1, 1].flatMap(s => {
+  const l = BABYLON.MeshBuilder.CreateCylinder("leg", { diameterTop: 0.14, diameterBottom: 0.09, height: 0.82, tessellation: 8 }, scene);
+  l.position.set(0, 0.45, s * 0.09);
+  const shoe = BABYLON.MeshBuilder.CreateSphere("shoe", { diameter: 1, segments: 4 }, scene); // pointed medieval shoe
+  shoe.scaling.set(0.24, 0.08, 0.1); shoe.position.set(0.05, 0.04, s * 0.09);
+  return [l, shoe];
+}), true);
+legsMesh.name = "crowdLegs"; legsMesh.material = crowdCloth;
+const legsM = [], legsC = [];
+function addPerson(x, z, { cheer = false, cloth = pick(clothes), tall = 0.95 + Math.random() * 0.12, face = Math.PI / 2, wear } = {}) {
+  const q = BABYLON.Quaternion.RotationAxis(BABYLON.Axis.Y, face), y = 1.16 * tall; // torso centre above the feet
+  poseM[cheer ? 1 : 0].push(BABYLON.Matrix.Compose(V3(1, tall, 1), q, V3(x, y, z)));
+  poseC[cheer ? 1 : 0].push(...cloth, 1);
+  legsM.push(BABYLON.Matrix.Compose(V3(1, tall, 1), q, V3(x, 0, z))); legsC.push(...pick(hose), 1);
+  const hy = y + 0.44 * tall;
+  headM.push(BABYLON.Matrix.Translation(x, hy, z)); headC.push(...pick(skins), 1);
+  const kind = wear || (Math.random() < 0.3 ? "hood" : Math.random() < 0.35 ? "hat" : "hair");
+  wearM[kind].push(BABYLON.Matrix.Translation(x, hy + (kind === "hat" ? 0.08 : kind === "hood" ? -0.01 : 0.02), z));
+  wearC[kind].push(...(kind === "hair" ? pick(hairColours) : pick(clothes)), 1);
+}
+const ROPE_Z = TRACK_HALF + 6;
+for (const end of [-1, 1]) {
+  for (let row = 0; row < 4; row++) for (let x = -7.6; x <= 7.6; x += 0.55) {
+    if (Math.random() < 0.12) continue;
+    addPerson(x + (Math.random() - 0.5) * 0.25, end * (ROPE_Z + 1 + row * 0.75 + Math.random() * 0.3), { cheer: Math.random() < 0.4 });
+  }
+  // red rope barrier on posts, sagging between them
+  const post = BABYLON.MeshBuilder.CreateCylinder("ropePost", { diameter: 0.1, height: 1.1, tessellation: 6 }, scene);
+  post.material = darkWood; post.position.set(-8, 0.55, end * ROPE_Z);
+  const rope = [];
+  for (let i = 0; i <= 64; i++) {  // 0.25 m steps, a post every 2 m
+    const x = -8 + i * 0.25, k = (i % 8) / 8;
+    rope.push(V3(x, 1.0 - 0.18 * Math.sin(Math.PI * k), end * ROPE_Z));
+    if (i % 8 === 0 && i > 0) post.createInstance("rp").position.set(x, 0.55, end * ROPE_Z);
+  }
+  BABYLON.MeshBuilder.CreateTube("rope", { path: rope, radius: 0.025, tessellation: 6 }, scene).material = pbr("ropeRed", [0.45, 0.05, 0.04], 0, 0.8);
+}
+// Squires in team colours beside each lance rack; marshals with white staffs at the walls
+const team = a => BABYLON.Color3.FromHexString(a.field).asArray();
+for (const [x, z, a] of [[6.3, -TRACK_HALF - 2.2, ARMS.player], [6.6, -TRACK_HALF - 4.2, ARMS.player], [-6.3, TRACK_HALF + 2.2, ARMS.bot], [-6.6, TRACK_HALF + 4.2, ARMS.bot]])
+  addPerson(x, z, { cloth: team(a), face: 0, wear: "hair" });
+const marshalStaff = BABYLON.MeshBuilder.CreateCylinder("staff", { diameter: 0.035, height: 1.9, tessellation: 6 }, scene);
+marshalStaff.material = pbr("staffWhite", [0.92, 0.9, 0.85], 0, 0.6); marshalStaff.isVisible = false;
+for (const [x, z] of [[7.5, -3], [-7.5, 3], [7.5, 30], [-7.5, -30]]) {
+  addPerson(x, z, { cloth: [0.55, 0.42, 0.1], face: 0, wear: "hat" });
+  marshalStaff.createInstance("ms").position.set(x - Math.sign(x) * 0.28, 0.95, z + 0.1);
+}
+legsMesh.thinInstanceSetBuffer("matrix", (ms => { const b = new Float32Array(ms.length * 16); ms.forEach((m, i) => m.copyToArray(b, i * 16)); return b; })(legsM), 16);
+legsMesh.thinInstanceSetBuffer("color", new Float32Array(legsC), 4); legsMesh.thinInstanceRefreshBoundingInfo();
 const toBuf = ms => { const b = new Float32Array(ms.length * 16); ms.forEach((m, i) => m.copyToArray(b, i * 16)); return b; };
 crowdPoses.forEach((m, i) => {
   m.thinInstanceSetBuffer("matrix", toBuf(poseM[i]), 16); m.thinInstanceSetBuffer("color", new Float32Array(poseC[i]), 4);
@@ -302,12 +382,29 @@ for (const [k, m] of Object.entries(wearMeshes)) {
 function makeFlag(base, poleH, arms) {
   const pole = BABYLON.MeshBuilder.CreateCylinder("flagPole", { diameter: 0.08, height: poleH, tessellation: 6 }, scene);
   pole.position = base.add(V3(0, poleH / 2, 0)); pole.material = darkWood;
-  const flag = BABYLON.MeshBuilder.CreatePlane("flag", { width: 1.2, height: 0.8, sideOrientation: BABYLON.Mesh.DOUBLESIDE }, scene);
-  flag.setPivotPoint(V3(-0.6, 0, 0));
-  flag.position = base.add(V3(0.6, poleH - 0.45, 0)); flag.rotation.y = Math.PI / 2;
-  flag.material = painted("arms" + arms.kind, 128, 96, drawArms(arms));
+  // Cloth flag: a small grid fixed along the pole edge; its vertices ripple each frame (see waveFlag)
+  const W = 1.2, H = 0.8, NX = 8, NY = 4, rows = [];
+  for (let j = 0; j <= NY; j++) { const row = []; for (let i = 0; i <= NX; i++) row.push(V3(i / NX * W, (0.5 - j / NY) * H, 0)); rows.push(row); }
+  const flag = BABYLON.MeshBuilder.CreateRibbon("flag", { pathArray: rows, updatable: true, sideOrientation: BABYLON.Mesh.DOUBLESIDE }, scene);
+  flag.position = base.add(V3(0, poleH - 0.45, 0)); flag.rotation.y = Math.PI / 2;
+  flagMats[arms.kind] = flagMats[arms.kind] || painted("arms" + arms.kind, 128, 96, drawArms(arms));
+  flag.material = flagMats[arms.kind];
+  const pos = flag.getVerticesData(BABYLON.VertexBuffer.PositionKind);
+  flag.cloth = { base: Float32Array.from(pos), pos: Float32Array.from(pos), nrm: new Float32Array(pos.length), idx: flag.getIndices(), W };
   flag.phase = Math.random() * 6;
   return flag;
+}
+// Travelling wave from the pole outward: amplitude grows toward the free edge, which also droops a little
+function waveFlag(f, now) {
+  const { base, pos, nrm, idx, W } = f.cloth;
+  for (let i = 0; i < base.length; i += 3) {
+    const x = base[i], t = x / W;
+    pos[i] = x * (1 - 0.04 * t);
+    pos[i + 1] = base[i + 1] - 0.05 * t * t;
+    pos[i + 2] = Math.sin(x * 5 - now * 7 + f.phase) * 0.09 * t + Math.sin(now * 2.3 + f.phase) * 0.05 * t;
+  }
+  f.updateVerticesData(BABYLON.VertexBuffer.PositionKind, pos);
+  BABYLON.VertexData.ComputeNormals(pos, idx, nrm); f.updateVerticesData(BABYLON.VertexBuffer.NormalKind, nrm);
 }
 (function pavilions() {
   const roofs = [["#d6a826", "#1d3a8a"], ["#efe8d8", "#9b1414"], ["#d6a826", "#9b1414"], ["#efe8d8", "#1d3a8a"]]
@@ -348,6 +445,7 @@ function makeFlag(base, poleH, arms) {
       roof.position.set(ctr.x, top + h / 2 - 0.4, ctr.z); roof.material = slate;
       flags.push(makeFlag(V3(ctr.x, top + h - 0.6, ctr.z), 3, ARMS.player));
     }
+    freezeStatic();
   }).catch(e => console.warn("castle", e.message));
 })();
 
@@ -412,13 +510,8 @@ const PROP_LAYOUT = {
   wooden_lantern_01: [[0.6, 76.2, 0, 1], [-1.0, -76.2, 0, 1]],
   tree_stump_01: [[-24, 40, 0.5, 1.2], [26, -60, 2, 1], [-30, -20, 1, 1.4]],
   boulder_01: [[-28, 60, 0.3, 1.5], [30, 10, 1.6, 1.2], [-22, -70, 2.2, 1.8]],
-  grass_medium_01: [], shrub_03: [],
   curtain: [[0, 150, 0, 1]],  // photoscanned curtain wall + gatehouse tower closing the far end of the field
 };
-for (let i = 0; i < 70; i++) {  // tufts of grass and low shrubs scattered round the outside of the stands and tents
-  const side = i % 2 ? 1 : -1, x = side * (25 + Math.random() * 30), z = (Math.random() - 0.5) * 220;
-  (i % 3 ? PROP_LAYOUT.grass_medium_01 : PROP_LAYOUT.shrub_03).push([x, z, Math.random() * 6, 0.8 + Math.random() * 0.6]);
-}
 Object.entries(PROP_LAYOUT).forEach(([name, spots]) => {
   if (!spots.length) return;
   BABYLON.SceneLoader.LoadAssetContainerAsync("assets/props/", name + ".glb", scene).then(c => {
@@ -431,6 +524,7 @@ Object.entries(PROP_LAYOUT).forEach(([name, spots]) => {
         if (Math.abs(z) < TRACK_HALF + 20 && Math.abs(x) < 12) shadows.addShadowCaster(m);
       }
     }
+    freezeStatic();
   }).catch(e => console.warn("prop", name, e.message));
 });
 
@@ -523,6 +617,22 @@ const player = makeRider("player", LANE, 1, ARMS.player);
 const bot = makeRider("bot", -LANE, -1, ARMS.bot);
 const riders = [player, bot];
 
+// --- Lance racks at each end of the lists, stocked with spare lances in each rider's colours
+for (const [x, z, r] of [[7.3, -TRACK_HALF - 3.2, player], [-7.3, TRACK_HALF + 3.2, bot]]) {
+  for (const dz of [-1.1, 1.1]) {
+    const p = BABYLON.MeshBuilder.CreateCylinder("rackPost", { diameter: 0.12, height: 2.3, tessellation: 8 }, scene);
+    p.position.set(x, 1.15, z + dz); p.material = darkWood; shadows.addShadowCaster(p);
+  }
+  const bar = BABYLON.MeshBuilder.CreateCylinder("rackBar", { diameter: 0.09, height: 2.4, tessellation: 8 }, scene);
+  bar.rotation.x = Math.PI / 2; bar.position.set(x, 2.1, z); bar.material = darkWood;
+  for (let i = 0; i < 6; i++) {
+    const l = BABYLON.MeshBuilder.CreateCylinder("spareLance", { diameterTop: 0.05, diameterBottom: 0.12, height: LANCE_LEN, tessellation: 10 }, scene);
+    l.material = r.lance.material; l.rotation.z = -Math.sign(x) * 0.16; l.rotation.y = (Math.random() - 0.5) * 0.1;
+    l.position.set(x - Math.sign(x) * 0.32, LANCE_LEN / 2 - 0.05, z - 0.9 + i * 0.36);
+    shadows.addShadowCaster(l);
+  }
+}
+
 // --- Camera: chase cam behind the player, offset to the outside so the lance and opponent are visible
 const camera = new BABYLON.UniversalCamera("cam", BABYLON.Vector3.Zero(), scene);
 camera.minZ = 0.1; camera.maxZ = 3000; camera.fov = 0.82;
@@ -541,9 +651,37 @@ pipeline.chromaticAberrationEnabled = true; pipeline.chromaticAberration.aberrat
 pipeline.sharpenEnabled = true; pipeline.sharpen.edgeAmount = 0.25;
 // Ambient occlusion grounds objects in soft contact shadows (desktop only: too costly for phones)
 const isPhone = matchMedia("(pointer: coarse)").matches;
-if (!isPhone && BABYLON.SSAO2RenderingPipeline.IsSupported) {
-  const ssao = new BABYLON.SSAO2RenderingPipeline("ssao", scene, { ssaoRatio: 0.5, blurRatio: 0.5 }, [camera]);
-  ssao.radius = 1.2; ssao.totalStrength = 1.1; ssao.samples = 12; ssao.maxZ = 120; ssao.expensiveBlur = false;
+let ssao = null;
+// Graphics quality. High: SSAO, film grain, lens fringing, sharpening, 4x MSAA, contact-hardening 2048 shadows,
+// full resolution. Low drops all of those for a smooth frame rate. Starts high (low on phones); the game drops to
+// low by itself if it can't hold ~33 FPS, and Q switches by hand.
+const quality = { high: !isPhone, auto: true, fps: [], since: 0 };
+function setQuality(high) {
+  quality.high = high;
+  if (high && !ssao && !isPhone && BABYLON.SSAO2RenderingPipeline.IsSupported) {
+    ssao = new BABYLON.SSAO2RenderingPipeline("ssao", scene, { ssaoRatio: 0.5, blurRatio: 0.5 }, [camera]);
+    ssao.radius = 1.2; ssao.totalStrength = 1.1; ssao.samples = 12; ssao.maxZ = 120; ssao.expensiveBlur = false;
+  } else if (!high && ssao) {
+    scene.postProcessRenderPipelineManager.detachCamerasFromRenderPipeline("ssao", camera); ssao.dispose(); ssao = null;
+  }
+  pipeline.grainEnabled = pipeline.chromaticAberrationEnabled = pipeline.sharpenEnabled = high;
+  pipeline.samples = high ? 4 : 1; pipeline.fxaaEnabled = !high;
+  shadows.useContactHardeningShadow = high; shadows.usePercentageCloserFiltering = !high;
+  shadows.getShadowMap().resize(high ? 2048 : 1024);
+  engine.setHardwareScalingLevel(high ? 1 : 1.25);
+}
+setQuality(quality.high);
+addEventListener("keydown", e => { if (e.code === "KeyQ") { quality.auto = false; setQuality(!quality.high); } });
+function autoQuality(now) { // average the frame rate over 3 s once loaded; only while the tab is actually visible
+  if (!quality.auto || !quality.high || document.visibilityState !== "visible" || state === "loading") return;
+  if (!quality.since) quality.since = now;
+  if (now - quality.since < 4) return; // let shaders and textures settle first
+  quality.fps.push(engine.getFps());
+  if (quality.fps.length > 180) {
+    const avg = quality.fps.reduce((a, b) => a + b) / quality.fps.length;
+    quality.fps.length = 0;
+    if (avg < 33) { setQuality(false); quality.auto = false; say("Graphics lowered for a smoother game — press Q to switch", 2500); }
+  }
 }
 const camOffset = new BABYLON.Vector3(1.9, 2.75, -5.2);
 
@@ -677,7 +815,18 @@ function resetPass() {
   state = "ready";
   sfx.fanfare(); // the herald calls each pass
 }
-function newMatch() { pass = 1; for (const r of riders) r.score = 0; msgEl.style.opacity = 0; resetPass(); }
+function newMatch() { pass = 1; for (const r of riders) r.score = 0; msgEl.style.opacity = 0; resetPass(); freezeStatic(); }
+// Performance: anything that never moves gets its world matrix frozen, so the engine stops recomputing
+// ~1000 matrices and bounding boxes every frame. Riders, flags, banners, cloth and splinters stay live.
+function freezeStatic() {
+  const live = new Set([...flags, ...banners]);
+  for (const m of scene.meshes) {
+    if (m.isWorldMatrixFrozen || live.has(m) || m.cloth || m.name === "splinter") continue;
+    if (riders.some(r => m.isDescendantOf(r.mount) || m.isDescendantOf(r.knight))) continue;
+    m.computeWorldMatrix(true); m.freezeWorldMatrix(); m.doNotSyncBoundingInfo = true;
+  }
+}
+scene.skipPointerMovePicking = true; // the game never picks with the mouse
 
 // Hit check when the attacker's lance tip crosses the defender's body plane (robust at 25+ m/s closing speed)
 // The unhorsed knight leaves the saddle: thrown back and outward, tumbling, lands on his back in a puff of sand
@@ -851,6 +1000,31 @@ const SEAT = { y: 1.6, z: 0.15 }, BODY = { z: -0.05, length: 1.62, width: 0.78 }
 const dustTex = new BABYLON.DynamicTexture("dustTex", 64, scene, false);
 (g => { const r = g.createRadialGradient(32, 32, 2, 32, 32, 31); r.addColorStop(0, "rgba(255,255,255,0.9)"); r.addColorStop(1, "rgba(255,255,255,0)"); g.fillStyle = r; g.fillRect(0, 0, 64, 64); })(dustTex.getContext());
 dustTex.hasAlpha = true; dustTex.update();
+// --- Campfires between the tents: glowing embers and a column of smoke drifting with the breeze
+for (const [x, z] of [[-18, 84], [17, -86]]) {
+  for (let k = 0; k < 4; k++) {
+    const log = BABYLON.MeshBuilder.CreateCylinder("log", { diameter: 0.14, height: 1.0, tessellation: 8 }, scene);
+    log.rotation.z = Math.PI / 2; log.rotation.y = k * Math.PI / 4; log.position.set(x, 0.08, z); log.material = darkWood;
+  }
+  const fire = new BABYLON.ParticleSystem("fire", 120, scene);
+  fire.particleTexture = dustTex; fire.emitter = V3(x, 0.15, z);
+  fire.minEmitBox = V3(-0.3, 0, -0.3); fire.maxEmitBox = V3(0.3, 0, 0.3);
+  fire.color1 = new BABYLON.Color4(1, 0.55, 0.15, 0.9); fire.color2 = new BABYLON.Color4(1, 0.3, 0.05, 0.8); fire.colorDead = new BABYLON.Color4(0.3, 0.05, 0, 0);
+  fire.minSize = 0.2; fire.maxSize = 0.55; fire.minLifeTime = 0.3; fire.maxLifeTime = 0.8; fire.emitRate = 70;
+  fire.direction1 = V3(-0.2, 1, -0.2); fire.direction2 = V3(0.2, 1.6, 0.2); fire.minEmitPower = 0.6; fire.maxEmitPower = 1.2;
+  fire.blendMode = BABYLON.ParticleSystem.BLENDMODE_ADD; fire.start();
+  const smoke = new BABYLON.ParticleSystem("smoke", 160, scene);
+  smoke.particleTexture = dustTex; smoke.emitter = V3(x, 0.8, z);
+  smoke.minEmitBox = V3(-0.2, 0, -0.2); smoke.maxEmitBox = V3(0.2, 0.2, 0.2);
+  smoke.color1 = new BABYLON.Color4(0.45, 0.44, 0.42, 0.28); smoke.color2 = new BABYLON.Color4(0.6, 0.6, 0.6, 0.2); smoke.colorDead = new BABYLON.Color4(0.7, 0.7, 0.72, 0);
+  smoke.minSize = 0.6; smoke.maxSize = 1.4; smoke.minScaleX = smoke.minScaleY = 1;
+  smoke.addSizeGradient(0, 0.6); smoke.addSizeGradient(1, 4.5);
+  smoke.minLifeTime = 4; smoke.maxLifeTime = 7; smoke.emitRate = 14;
+  smoke.direction1 = V3(0.1, 1, -0.1); smoke.direction2 = V3(0.5, 1.4, 0.2); smoke.minEmitPower = 0.5; smoke.maxEmitPower = 0.9;
+  smoke.gravity = V3(0.25, 0.05, 0.05); smoke.minAngularSpeed = -0.3; smoke.maxAngularSpeed = 0.3;
+  smoke.blendMode = BABYLON.ParticleSystem.BLENDMODE_STANDARD; smoke.start();
+}
+
 function makeDust(r) {
   const ps = new BABYLON.ParticleSystem(r.name + "dust", 400, scene);
   ps.particleTexture = dustTex;
@@ -1053,7 +1227,9 @@ scene.onBeforeRenderObservable.add(() => {
 
   // Sun's shadow box follows the player; banners flutter
   sun.position = player.mount.position.subtract(sun.direction.scale(60));
-  for (const f of flags) f.rotation.y = Math.PI / 2 + Math.sin(now * 2.2 + f.phase) * 0.25;
+  for (const f of flags) waveFlag(f, now);
+  autoQuality(now);
+  for (const b of banners) { b.rotation.z = Math.sin(now * 1.1 + b.phase) * 0.03; } // long banners stir in the breeze
   // Crowd excitement: builds as the knights close on each other, spikes on a hit, then settles
   const closing = state === "riding" ? Math.max(0, 1 - Math.abs(bot.mount.position.z - player.mount.position.z) / 35) : 0;
   crowd.excite = Math.max(0, crowd.excite - dt * 0.35);
@@ -1075,7 +1251,7 @@ scene.onBeforeRenderObservable.add(() => {
     + `Space / right-click: raise shield (max ${GUARD_MAX}s)<br>Shield +1 · Body +2 · Guard blocks body hits<br>`
     + `Centred hit at ≥ ${(BREAK_SPEED * 3.6).toFixed(0)} km/h breaks the lance +1<br>`
     + `Dead-centre body hit at ≥ ${(DISMOUNT_SPEED * 3.6).toFixed(0)} km/h unhorses — instant win<br>`
-    + `M: sound on/off<br>`
+    + `M: sound on/off &nbsp; Q: graphics ${quality.high ? "high" : "low"}<br>`
     + `Speed: ${(player.speed * 3.6).toFixed(0)} km/h &nbsp; Shield: <b>${guardLabel}</b>`
     + (state === "ready" ? "<br><b>Press W to charge</b>" : "");
 });
