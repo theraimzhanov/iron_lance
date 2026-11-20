@@ -1,0 +1,1087 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Iron Lance — Prototype</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #1a1612; font-family: system-ui, sans-serif; }
+  canvas { width: 100%; height: 100%; display: block; touch-action: none; }
+  #hud { position: fixed; top: 12px; left: 12px; color: #f3e9d2; background: rgba(0,0,0,.45); padding: 10px 14px; border-radius: 8px; font-size: 14px; line-height: 1.5; pointer-events: none; }
+  #score { position: fixed; top: 12px; right: 16px; color: #f3e9d2; font-size: 28px; font-weight: 800; text-shadow: 0 2px 8px #000; pointer-events: none; }
+  #msg { position: fixed; top: 22%; width: 100%; text-align: center; font-size: clamp(22px, 4vw, 44px); font-weight: 800; color: #ffd24a; text-shadow: 0 3px 12px #000; opacity: 0; transition: opacity .25s; pointer-events: none; white-space: pre-line; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="hud">Loading horses…</div>
+<div id="score"></div>
+<div id="msg"></div>
+<script src="https://cdn.jsdelivr.net/npm/babylonjs@9.30.0/babylon.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/babylonjs-loaders@9.30.0/babylonjs.loaders.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/earcut@2.2.4/dist/earcut.min.js"></script>
+<script>
+const LANE = 1.0, TRACK_HALF = 55, MAX_SPEED = 14, LANCE_LEN = 4.0, PASSES = 3;
+const BOT_AIM_ERROR = 0.28; // metres of aim scatter; lower = harder bot
+// Guard: raising the shield turns body hits (+2) into shield hits (+1), but the arm tires after
+// GUARD_MAX seconds and your own lance wobbles while guarding — so timing matters.
+const GUARD_MAX = 1.2, GUARD_COOLDOWN = 1.5, GUARD_WOBBLE = 0.06;
+// Lance break (+1 bonus): a hit landed at speed AND near the centre of the target. Deterministic, so it's skill.
+const BREAK_SPEED = 10, BREAK_CENTRE = 0.6; // m/s of the attacker; fraction of the hit zone counted as "centred"
+// Dismount (instant victory): unguarded body hit, nearly dead centre, at near full speed. Raising the shield prevents it.
+const DISMOUNT_SPEED = 11.5, DISMOUNT_CENTRE = 0.45;
+
+const canvas = document.getElementById("c");
+const engine = new BABYLON.Engine(canvas, true);
+const scene = new BABYLON.Scene(engine);
+const V3 = (x, y, z) => new BABYLON.Vector3(x, y, z), C3 = (r, g, b) => new BABYLON.Color3(r, g, b);
+
+// --- Sky + image-based lighting from a real photographed HDRI (Poly Haven, CC0)
+const HDRI_URL = "https://dl.polyhaven.org/file/ph-assets/HDRIs/hdr/2k/meadow_2_2k.hdr";
+// No prefilter pass: on integrated GPUs prefiltering a big cube can exceed the OS GPU timeout and lose the WebGL context
+const hdr = new BABYLON.HDRCubeTexture(HDRI_URL, scene, 512, false, true, false, false);
+scene.environmentTexture = hdr;
+const skybox = scene.createDefaultSkybox(hdr, true, 1500, 0);
+skybox.applyFog = false;
+// Atmospheric haze: barely there across the lists, softening the castle and far field like real air
+scene.fogMode = BABYLON.Scene.FOGMODE_EXP2; scene.fogDensity = 0.0026; scene.fogColor = C3(0.5, 0.58, 0.68);
+
+const sun = new BABYLON.DirectionalLight("sun", V3(-0.45, -1, 0.35).normalize(), scene);
+sun.intensity = 3.2;
+sun.autoUpdateExtends = false; // shadow box follows the player instead of covering the whole 110 m list
+sun.orthoLeft = sun.orthoBottom = -22; sun.orthoRight = sun.orthoTop = 22; sun.shadowMinZ = 1; sun.shadowMaxZ = 140;
+const shadows = new BABYLON.ShadowGenerator(2048, sun);
+// Contact-hardening shadows: sharp where objects touch the ground, softening with distance, like real sunlight
+shadows.useContactHardeningShadow = true; shadows.contactHardeningLightSizeUVRatio = 0.04;
+shadows.filteringQuality = BABYLON.ShadowGenerator.QUALITY_MEDIUM;
+shadows.bias = 0.002; shadows.normalBias = 0.02;
+
+// --- Materials. Poly Haven PBR textures (CC0) for ground and wood; procedural for metal and cloth.
+// A few Poly Haven sets name their colour map "albedo" instead of "diff" (a wrong name 404s into Babylon's checkerboard)
+const PH_NAMES = { brown_leather: { diff: "albedo" } };
+const PH = (id, kind) => `https://dl.polyhaven.org/file/ph-assets/Textures/jpg/1k/${id}/${id}_${(PH_NAMES[id] || {})[kind] || kind}_1k.jpg`;
+function pbrTextured(name, id, u, v) {
+  const m = new BABYLON.PBRMaterial(name, scene);
+  const t = kind => { const tx = new BABYLON.Texture(PH(id, kind), scene); tx.uScale = u; tx.vScale = v; return tx; };
+  m.albedoTexture = t("diff"); m.bumpTexture = t("nor_gl"); m.metallicTexture = t("arm");
+  m.useAmbientOcclusionFromMetallicTextureRed = m.useRoughnessFromMetallicTextureGreen = m.useMetallnessFromMetallicTextureBlue = true;
+  m.metallic = 1; m.roughness = 1;
+  return m;
+}
+// Scanned surface detail (Poly Haven, CC0): real weave, grain and scratches as normal + roughness maps
+const scanTex = {};
+function phTex(id, kind, u, v) {
+  const key = `${id}/${kind}/${u}/${v}`;
+  if (!scanTex[key]) { const t = new BABYLON.Texture(PH(id, kind), scene); t.uScale = u; t.vScale = v; scanTex[key] = t; }
+  return scanTex[key];
+}
+function weave(mat, id, u, v, level = 0.7) { mat.bumpTexture = phTex(id, "nor_gl", u, v); mat.bumpTexture.level = level; return mat; }
+// Metal/leather from a scan: its albedo tinted, its normal and roughness/AO map; per rider so hit flashes stay separate
+function scanMat(name, id, tint, metallic, u, v, useAlbedo = true, roughScale = 1) {
+  const m = new BABYLON.PBRMaterial(name, scene);
+  if (useAlbedo) m.albedoTexture = phTex(id, "diff", u, v);
+  m.albedoColor = C3(...tint); m.roughness = roughScale;
+  m.bumpTexture = phTex(id, "nor_gl", u, v); m.metallicTexture = phTex(id, "arm", u, v);
+  m.useAmbientOcclusionFromMetallicTextureRed = m.useRoughnessFromMetallicTextureGreen = true;
+  m.useMetallnessFromMetallicTextureBlue = false; m.metallic = metallic;
+  return m;
+}
+function pbr(name, colour, metallic, roughness) {
+  const m = new BABYLON.PBRMetallicRoughnessMaterial(name, scene);
+  m.baseColor = C3(...colour); m.metallic = metallic; m.roughness = roughness;
+  return m;
+}
+// Draw onto a canvas texture (heraldry, striped cloth, flags)
+function painted(name, w, h, draw, u = 1, v = 1) {
+  const tex = new BABYLON.DynamicTexture(name, { width: w, height: h }, scene, true);
+  draw(tex.getContext(), w, h); tex.update(); tex.uScale = u; tex.vScale = v;
+  tex.wrapU = tex.wrapV = BABYLON.Texture.WRAP_ADDRESSMODE;
+  const m = new BABYLON.PBRMaterial(name, scene);
+  m.albedoTexture = tex; m.metallic = 0; m.roughness = 0.85; m.backFaceCulling = false;
+  return m;
+}
+const stripes = (a, b, n) => (g, w, h) => { for (let i = 0; i < n; i++) { g.fillStyle = i % 2 ? b : a; g.fillRect(i * w / n, 0, w / n + 1, h); } };
+// Heraldic arms: field + an ordinary (chevron or cross) — each team gets its own
+const ARMS = {
+  player: { field: "#1d3a8a", charge: "#d9a521", kind: "chevron" },
+  bot: { field: "#9b1414", charge: "#efe8d8", kind: "cross" },
+};
+const drawArms = a => (g, w, h) => {
+  g.fillStyle = a.field; g.fillRect(0, 0, w, h); g.fillStyle = a.charge;
+  if (a.kind === "cross") { g.fillRect(w * 0.4, 0, w * 0.2, h); g.fillRect(0, h * 0.32, w, h * 0.2); }
+  else { g.beginPath(); g.moveTo(0, h * 0.8); g.lineTo(w / 2, h * 0.3); g.lineTo(w, h * 0.8); g.lineTo(w, h * 0.98); g.lineTo(w / 2, h * 0.5); g.lineTo(0, h * 0.98); g.fill(); }
+};
+
+const groundMat = pbrTextured("grass", "sparse_grass", 70, 120);
+const sandMat = pbrTextured("sand", "sand_01", 12, 95);
+const darkWood = pbr("darkWood", [0.07, 0.055, 0.045], 0, 0.7);
+const stone = pbrTextured("stone", "castle_wall_slates", 8, 4);
+stone.albedoColor = C3(0.72, 0.68, 0.62); // weathered, warmer stone rather than bright grey
+const slate = pbrTextured("slate", "roof_slates_02", 4, 2);
+const standWood = pbrTextured("standWood", "brown_planks_03", 2, 12);
+const LIST_W = 17, LIST_LEN = 2 * TRACK_HALF + 30;
+
+// --- Ground: grass field with a sand list
+const ground = BABYLON.MeshBuilder.CreateGround("ground", { width: 260, height: 520, subdivisions: 2 }, scene);
+ground.material = groundMat; ground.receiveShadows = true;
+const lists = BABYLON.MeshBuilder.CreateGround("lists", { width: LIST_W, height: LIST_LEN }, scene);
+lists.position.y = 0.01; lists.material = sandMat; lists.receiveShadows = true;
+
+// --- Tilt: black posts on A-frame feet, a top rail, and patterned cloth draped over it, sagging between posts
+const POST_GAP = 2.5, TILT_H = 1.6;
+const tiltPost = BABYLON.MeshBuilder.CreateBox("tiltPost", { width: 0.12, height: TILT_H, depth: 0.12 }, scene);
+const legL = BABYLON.MeshBuilder.CreateBox("tiltLeg", { width: 0.09, height: 0.95, depth: 0.09 }, scene);
+const legR = legL.clone("tiltLegR");
+const foot = BABYLON.MeshBuilder.CreateBox("tiltFoot", { width: 0.95, height: 0.07, depth: 0.1 }, scene);
+legL.position.set(-0.2, 0.42, 0); legL.rotation.z = -0.5;
+legR.position.set(0.2, 0.42, 0); legR.rotation.z = 0.5;
+foot.position.y = 0.035; tiltPost.position.y = TILT_H / 2;
+const tiltUnit = BABYLON.Mesh.MergeMeshes([tiltPost, legL, legR, foot], true);
+tiltUnit.material = darkWood; tiltUnit.position.z = -TRACK_HALF;
+shadows.addShadowCaster(tiltUnit); tiltUnit.receiveShadows = true;
+for (let z = -TRACK_HALF + POST_GAP; z <= TRACK_HALF; z += POST_GAP) {
+  const u = tiltUnit.createInstance("tilt"); u.position.z = z;
+}
+const rail = BABYLON.MeshBuilder.CreateBox("rail", { width: 0.1, height: 0.1, depth: 2 * TRACK_HALF }, scene);
+rail.position.y = TILT_H; rail.material = darkWood;
+const drapeMat = painted("drapeCloth", 256, 256, (g, w, h) => {
+  g.fillStyle = "#e3b04e"; g.fillRect(0, 0, w, h);
+  const bands = [[0.12, 0.05, "#5a3a1c"], [0.22, 0.02, "#7a5226"], [0.42, 0.07, "#5a3a1c"], [0.55, 0.02, "#e2b45a"], [0.7, 0.05, "#5a3a1c"], [0.86, 0.025, "#7a5226"]];
+  for (const [y, t, c] of bands) { g.fillStyle = c; g.fillRect(0, y * h, w, t * h); }
+  g.fillStyle = "rgba(90,58,28,0.35)"; // woven motif
+  for (let x = 0; x < w; x += 16) for (let y = 0.28 * h; y < 0.4 * h; y += 10) g.fillRect(x + (y % 20 ? 8 : 0), y, 6, 4);
+  g.fillStyle = "#3b2612"; g.fillRect(0, h - 6, w, 6);
+}, 1, 1);
+weave(drapeMat, "rough_linen", 2 * TRACK_HALF, 1.2);
+for (const side of [-1, 1]) {
+  const top = [], bottom = [];
+  for (let z = -TRACK_HALF; z <= TRACK_HALF; z += 0.25) {
+    const sag = Math.sin(Math.PI * (((z + TRACK_HALF) % POST_GAP) / POST_GAP));
+    top.push(V3(side * 0.06, TILT_H + 0.05 - 0.1 * sag, z));
+    bottom.push(V3(side * (0.1 + 0.03 * sag), 0.85 - 0.22 * sag, z));
+  }
+  const drape = BABYLON.MeshBuilder.CreateRibbon("drape", { pathArray: [top, bottom], sideOrientation: BABYLON.Mesh.DOUBLESIDE }, scene);
+  drape.material = drapeMat; drapeMat.albedoTexture.uScale = 2 * TRACK_HALF / POST_GAP;
+  shadows.addShadowCaster(drape); drape.receiveShadows = true;
+}
+
+// --- Palisade walls round the list: planks painted with yellow and red bands
+const wallMat = pbrTextured("wall", "brown_planks_03", 40, 1);
+wallMat.albedoTexture = painted("wallPaint", 1024, 128, (g, w, h) => {
+  g.fillStyle = "#4b3a29"; g.fillRect(0, 0, w, h);
+  for (let x = 0; x < w; x += 12) { g.fillStyle = `rgba(0,0,0,${0.1 + Math.random() * 0.15})`; g.fillRect(x, 0, 2, h); }
+  for (let x = 0; x < w; x += 256) {
+    g.fillStyle = "rgba(214,170,40,0.92)"; g.fillRect(x + 30, 0, 70, h);
+    g.fillStyle = "rgba(150,30,30,0.92)"; g.fillRect(x + 130, 0, 34, h);
+  }
+}).albedoTexture;
+wallMat.albedoTexture.uScale = LIST_LEN / 12;
+const WALL_H = 2.6, WALL_X = LIST_W / 2;
+for (const side of [-1, 1]) {
+  const wall = BABYLON.MeshBuilder.CreatePlane("wall", { width: LIST_LEN, height: WALL_H, sideOrientation: BABYLON.Mesh.DOUBLESIDE }, scene);
+  wall.position.set(side * WALL_X, WALL_H / 2, 0); wall.rotation.y = side * Math.PI / 2; wall.material = wallMat;
+  wall.receiveShadows = true;
+  const cap = BABYLON.MeshBuilder.CreateBox("wallCap", { width: 0.3, height: 0.12, depth: LIST_LEN }, scene);
+  cap.position.set(side * WALL_X, WALL_H, 0); cap.material = darkWood;
+}
+
+// --- Stands behind each wall, packed with a crowd (thin instances: thousands of people, two draw calls)
+const flags = [];
+// Spectator: shouldered torso + arms, one mesh per pose (arms down / arms raised and cheering)
+// Crowd motion on the GPU: every spectator (body, head, hat) bounces at its own rhythm, seeded from its position,
+// so thousands of thin instances come alive for free. crowd.amp rises as the knights close and after a hit.
+const crowd = { t: 0, amp: 0.02, excite: 0 };
+class CrowdBob extends BABYLON.MaterialPluginBase {
+  constructor(material) { super(material, "CrowdBob", 200, { CROWDBOB: false }); this._enable(true); }
+  prepareDefines(defines) { defines.CROWDBOB = true; }
+  getClassName() { return "CrowdBob"; }
+  getUniforms() {
+    return { ubo: [{ name: "crowdTime", size: 1, type: "float" }, { name: "crowdAmp", size: 1, type: "float" }],
+             vertex: "#ifdef CROWDBOB\nuniform float crowdTime;\nuniform float crowdAmp;\n#endif\n" };
+  }
+  bindForSubMesh(ubo) { ubo.updateFloat("crowdTime", crowd.t); ubo.updateFloat("crowdAmp", crowd.amp); }
+  getCustomCode(shaderType) {
+    if (shaderType !== "vertex") return null;
+    return { CUSTOM_VERTEX_UPDATE_WORLDPOS: `#ifdef CROWDBOB
+      { vec3 ip = finalWorld[3].xyz;
+        float ph = fract(sin(dot(ip.xz, vec2(12.9898, 78.233))) * 43758.5453);
+        worldPos.y += crowdAmp * (0.4 + ph) * max(0.0, sin(crowdTime * (5.0 + ph * 4.0) + ph * 6.2831)); }
+      #endif` };
+  }
+}
+const crowdCloth = pbr("crowdCloth", [1, 1, 1], 0, 0.95);
+new CrowdBob(crowdCloth);
+function makeFigure(name, cheering) {
+  const torso = BABYLON.MeshBuilder.CreateCylinder(name, { diameterTop: 0.44, diameterBottom: 0.3, height: 0.62, tessellation: 8 }, scene);
+  torso.scaling.x = 0.6;
+  const parts = [torso];
+  for (const s of [-1, 1]) {
+    const arm = BABYLON.MeshBuilder.CreateCapsule(name + "Arm", { radius: 0.055, height: 0.6, tessellation: 6, subdivisions: 1 }, scene);
+    if (cheering) { arm.position.set(0, 0.52, s * 0.3); arm.rotation.x = s * 0.45; }
+    else { arm.position.set(0, -0.02, s * 0.25); arm.rotation.x = -s * 0.12; }
+    parts.push(arm);
+  }
+  const m = BABYLON.Mesh.MergeMeshes(parts, true);
+  m.name = name; m.material = crowdCloth;
+  return m;
+}
+const crowdPoses = [makeFigure("crowdSeated", false), makeFigure("crowdCheer", true)];
+const crowdHead = BABYLON.MeshBuilder.CreateSphere("crowdHead", { diameter: 0.22, segments: 4 }, scene);
+crowdHead.material = pbr("crowdSkin", [1, 1, 1], 0, 0.7);
+new CrowdBob(crowdHead.material);
+const clothes = [[0.55, 0.1, 0.08], [0.42, 0.08, 0.06], [0.45, 0.3, 0.15], [0.6, 0.45, 0.25], [0.75, 0.68, 0.52], [0.25, 0.3, 0.15], [0.3, 0.18, 0.1], [0.7, 0.55, 0.15], [0.2, 0.2, 0.22], [0.5, 0.12, 0.1], [0.38, 0.28, 0.2]].map(c => c.map(v => v * 0.75)); // earthy, period cloth
+const skins = [[0.85, 0.65, 0.52], [0.75, 0.55, 0.42], [0.6, 0.42, 0.3], [0.9, 0.72, 0.6]];
+const poseM = [[], []], poseC = [[], []], headM = [], headC = [];
+// Headwear: hoods, brimmed hats, or just hair — each a thin-instance mesh tinted per person
+const wearMeshes = {
+  hood: BABYLON.MeshBuilder.CreateSphere("crowdHood", { diameter: 0.28, segments: 6, slice: 0.62 }, scene),
+  hat: BABYLON.Mesh.MergeMeshes([
+    BABYLON.MeshBuilder.CreateCylinder("brim", { diameter: 0.36, height: 0.015, tessellation: 10 }, scene),
+    Object.assign(BABYLON.MeshBuilder.CreateCylinder("crown", { diameterTop: 0.17, diameterBottom: 0.21, height: 0.12, tessellation: 10 }, scene), { position: V3(0, 0.06, 0) }),
+  ], true),
+  hair: BABYLON.MeshBuilder.CreateSphere("crowdHair", { diameter: 0.235, segments: 5, slice: 0.5 }, scene),
+};
+const wearM = { hood: [], hat: [], hair: [] }, wearC = { hood: [], hat: [], hair: [] };
+const hairColours = [[0.08, 0.05, 0.03], [0.2, 0.12, 0.06], [0.35, 0.25, 0.12], [0.05, 0.05, 0.05], [0.45, 0.4, 0.35]];
+for (const m of Object.values(wearMeshes)) m.material = crowdCloth;
+const pick = a => a[(Math.random() * a.length) | 0];
+const TIERS = 7, TIER_D = 1.1, TIER_RISE = 0.75, STAND_X = WALL_X + 0.8;
+for (const side of [-1, 1]) {
+  for (let i = 0; i < TIERS; i++) {
+    const h = 1.6 + i * TIER_RISE;
+    const tier = BABYLON.MeshBuilder.CreateBox("tier", { width: TIER_D, height: h, depth: LIST_LEN }, scene);
+    tier.position.set(side * (STAND_X + i * TIER_D + TIER_D / 2), h / 2, 0); tier.material = standWood;
+    for (let z = -LIST_LEN / 2 + 0.4; z < LIST_LEN / 2; z += 0.52) {
+      if (Math.random() < 0.08) continue;
+      const x = side * (STAND_X + i * TIER_D + TIER_D * 0.55) + (Math.random() - 0.5) * 0.25;
+      const zz = z + (Math.random() - 0.5) * 0.18, standing = Math.random() < 0.35, tall = 0.9 + Math.random() * 0.25;
+      const y = h + (standing ? 0.55 : 0.4) * tall;
+      const sy = standing ? tall : tall * 0.8, pose = standing && Math.random() < 0.55 ? 1 : 0; // standing fans cheer
+      poseM[pose].push(BABYLON.Matrix.Compose(V3(1, sy, 1), BABYLON.Quaternion.Identity(), V3(x, y, zz)));
+      poseC[pose].push(...pick(clothes), 1);
+      headM.push(BABYLON.Matrix.Translation(x, y + 0.44 * sy, zz));
+      const hy = y + 0.44 * sy, roll = Math.random();
+      const kind = roll < 0.28 ? "hood" : roll < 0.48 ? "hat" : "hair";
+      wearM[kind].push(BABYLON.Matrix.Translation(x, hy + (kind === "hat" ? 0.08 : kind === "hood" ? -0.01 : 0.02), zz));
+      wearC[kind].push(...(kind === "hair" ? pick(hairColours) : pick(clothes)), 1);
+      headC.push(...pick(skins), 1);
+    }
+  }
+  const back = BABYLON.MeshBuilder.CreateBox("standBack", { width: 0.25, height: 1.6 + TIERS * TIER_RISE + 2, depth: LIST_LEN }, scene);
+  back.position.set(side * (STAND_X + TIERS * TIER_D + 0.1), (1.6 + TIERS * TIER_RISE + 2) / 2, 0); back.material = standWood;
+  for (let z = -TRACK_HALF; z <= TRACK_HALF; z += 14) flags.push(makeFlag(V3(side * (STAND_X + TIERS * TIER_D + 0.1), 1.6 + TIERS * TIER_RISE + 2, z), 4, side > 0 ? ARMS.player : ARMS.bot));
+}
+const toBuf = ms => { const b = new Float32Array(ms.length * 16); ms.forEach((m, i) => m.copyToArray(b, i * 16)); return b; };
+crowdPoses.forEach((m, i) => {
+  m.thinInstanceSetBuffer("matrix", toBuf(poseM[i]), 16); m.thinInstanceSetBuffer("color", new Float32Array(poseC[i]), 4);
+  m.thinInstanceRefreshBoundingInfo();
+});
+crowdHead.thinInstanceSetBuffer("matrix", toBuf(headM), 16); crowdHead.thinInstanceSetBuffer("color", new Float32Array(headC), 4);
+crowdHead.thinInstanceRefreshBoundingInfo();
+for (const [k, m] of Object.entries(wearMeshes)) {
+  m.thinInstanceSetBuffer("matrix", toBuf(wearM[k]), 16); m.thinInstanceSetBuffer("color", new Float32Array(wearC[k]), 4);
+  m.thinInstanceRefreshBoundingInfo();
+}
+
+// Royal box: a red-and-black striped canopy over the middle of the right-hand stand
+(function royalBox() {
+  const x = STAND_X + 3.5, y = 1.6 + 3 * TIER_RISE + 2.6;
+  const roof = BABYLON.MeshBuilder.CreateBox("royalRoof", { width: 4.5, height: 0.08, depth: 8 }, scene);
+  roof.position.set(x, y, 0); roof.rotation.z = 0.15;
+  roof.material = weave(painted("royalCloth", 256, 32, stripes("#8e1313", "#1a1a1a", 8), 1, 4), "velour_velvet", 4, 8);
+  const valance = BABYLON.MeshBuilder.CreatePlane("valance", { width: 8, height: 0.5, sideOrientation: BABYLON.Mesh.DOUBLESIDE }, scene);
+  valance.position.set(x - 2.2, y - 0.3, 0); valance.rotation.y = Math.PI / 2; valance.material = roof.material;
+  for (const z of [-3.9, 3.9]) for (const dx of [-2, 2]) {
+    const p = BABYLON.MeshBuilder.CreateCylinder("royalPole", { diameter: 0.12, height: 2.8, tessellation: 8 }, scene);
+    p.position.set(x + dx, y - 1.4, z); p.material = pbr("gilt", [0.8, 0.6, 0.2], 1, 0.35);
+  }
+  shadows.addShadowCaster(roof);
+})();
+
+// --- Striped pavilions beyond each end of the list
+function makeFlag(base, poleH, arms) {
+  const pole = BABYLON.MeshBuilder.CreateCylinder("flagPole", { diameter: 0.08, height: poleH, tessellation: 6 }, scene);
+  pole.position = base.add(V3(0, poleH / 2, 0)); pole.material = darkWood;
+  const flag = BABYLON.MeshBuilder.CreatePlane("flag", { width: 1.2, height: 0.8, sideOrientation: BABYLON.Mesh.DOUBLESIDE }, scene);
+  flag.setPivotPoint(V3(-0.6, 0, 0));
+  flag.position = base.add(V3(0.6, poleH - 0.45, 0)); flag.rotation.y = Math.PI / 2;
+  flag.material = painted("arms" + arms.kind, 128, 96, drawArms(arms));
+  flag.phase = Math.random() * 6;
+  return flag;
+}
+(function pavilions() {
+  const roofs = [["#d6a826", "#1d3a8a"], ["#efe8d8", "#9b1414"], ["#d6a826", "#9b1414"], ["#efe8d8", "#1d3a8a"]]
+    .map(([a, b], i) => weave(painted("tentRoof" + i, 512, 64, stripes(a, b, 14)), "rough_linen", 12, 3));
+  const wallMat2 = weave(pbr("tentWall", [0.8, 0.76, 0.66], 0, 0.9), "rough_linen", 8, 3, 0.9); // canvas
+  let i = 0;
+  for (const zEnd of [-1, 1]) for (const x of [-12, -5, 5, 12]) {
+    const z = zEnd * (LIST_LEN / 2 + 9 + (i % 2) * 4), d = 4.5 + (i % 3);
+    const wall = BABYLON.MeshBuilder.CreateCylinder("tentWall", { diameter: d, height: 2.4, tessellation: 24 }, scene);
+    wall.position.set(x, 1.2, z); wall.material = wallMat2;
+    const roof = BABYLON.MeshBuilder.CreateCylinder("tentRoof", { diameterTop: 0, diameterBottom: d + 0.6, height: 2.6, tessellation: 24 }, scene);
+    roof.position.set(x, 3.7, z); roof.material = roofs[i % 4];
+    flags.push(makeFlag(V3(x, 5, z), 1.8, i % 2 ? ARMS.bot : ARMS.player));
+    i++;
+  }
+})();
+
+// --- Castle on a hill: assembled from a photoscanned stone fort kit (scripts/blender/assemble_castle.py),
+// with conical slate roofs and banners on its towers
+(function castle() {
+  const cx = -70, cz = 210, base = 7.5;
+  const hill = BABYLON.MeshBuilder.CreateSphere("hill", { diameter: 1, segments: 24 }, scene);
+  hill.scaling.set(150, 26, 110); hill.position.set(cx, -4, cz); hill.material = groundMat;
+  BABYLON.SceneLoader.LoadAssetContainerAsync("assets/props/", "castle.glb", scene).then(c => {
+    c.addAllToScene();
+    const root = c.rootNodes[0];
+    root.position.set(cx, base, cz); root.rotation = V3(0, Math.PI * 0.8, 0); root.rotationQuaternion = null; // gate turned toward the lists
+    root.computeWorldMatrix(true);
+    const roofed = [];
+    for (const m of root.getChildMeshes()) {
+      m.computeWorldMatrix(true); m.receiveShadows = true;
+      if (!/tower_round/.test(m.name)) continue;
+      const bb = m.getBoundingInfo().boundingBox, top = bb.maximumWorld.y, ctr = bb.centerWorld;
+      if (roofed.some(p => Math.hypot(p.x - ctr.x, p.z - ctr.z) < 3)) continue; // a tower has several material parts
+      roofed.push(ctr.clone());
+      const d = (bb.maximumWorld.x - bb.minimumWorld.x) * 1.08, h = d * 0.62;
+      const roof = BABYLON.MeshBuilder.CreateCylinder("towerRoof", { diameterTop: 0, diameterBottom: d, height: h, tessellation: 24 }, scene);
+      roof.position.set(ctr.x, top + h / 2 - 0.4, ctr.z); roof.material = slate;
+      flags.push(makeFlag(V3(ctr.x, top + h - 0.6, ctr.z), 3, ARMS.player));
+    }
+  }).catch(e => console.warn("castle", e.message));
+})();
+
+// --- Churned lanes: darker, hoof-worn earth along each rider's lane, fading into the sand at the edges
+(function lanes() {
+  const mat = pbrTextured("laneDirt", "brown_mud_02", 2, 60);
+  const fade = new BABYLON.DynamicTexture("laneFade", { width: 256, height: 4 }, scene, false);
+  const g = fade.getContext(), grad = g.createLinearGradient(0, 0, 256, 0);
+  grad.addColorStop(0, "rgba(255,255,255,0)"); grad.addColorStop(0.3, "rgba(255,255,255,0.85)");
+  grad.addColorStop(0.7, "rgba(255,255,255,0.85)"); grad.addColorStop(1, "rgba(255,255,255,0)");
+  g.fillStyle = grad; g.fillRect(0, 0, 256, 4); fade.update(); fade.hasAlpha = true;
+  mat.opacityTexture = fade; mat.transparencyMode = BABYLON.Material.MATERIAL_ALPHABLEND;
+  for (const x of [-LANE, LANE]) {
+    const lane = BABYLON.MeshBuilder.CreateGround("lane", { width: 2.6, height: 2 * TRACK_HALF + 6 }, scene);
+    lane.position.set(x, 0.015, 0); lane.material = mat; lane.receiveShadows = true;
+  }
+})();
+
+// --- Meadow grass: thousands of crossed-card clumps (thin instances, one draw call) round the outside of the lists
+(function meadow() {
+  const tex = new BABYLON.DynamicTexture("grassBlades", { width: 128, height: 128 }, scene, true);
+  const g = tex.getContext(); g.clearRect(0, 0, 128, 128);
+  for (let i = 0; i < 46; i++) {  // tapered blades of varied green, leaning a little
+    const x = 6 + Math.random() * 116, h = 60 + Math.random() * 66, lean = (Math.random() - 0.5) * 26;
+    const gr = 120 + Math.random() * 80, dry = Math.random() < 0.25; // some straw-coloured dry blades
+    g.fillStyle = dry ? `rgb(${gr * 0.95 | 0},${gr * 0.85 | 0},${gr * 0.45 | 0})` : `rgb(${gr * 0.6 | 0},${gr | 0},${gr * 0.28 | 0})`;
+    g.beginPath(); g.moveTo(x - 2.5, 128); g.quadraticCurveTo(x + lean * 0.4, 128 - h * 0.6, x + lean, 128 - h); g.lineTo(x + 2.5, 128); g.fill();
+  }
+  tex.update(); tex.hasAlpha = true;
+  const mat = new BABYLON.PBRMaterial("grassMat", scene);
+  mat.albedoTexture = tex; mat.useAlphaFromAlbedoTexture = true; mat.transparencyMode = BABYLON.Material.MATERIAL_ALPHATEST;
+  mat.alphaCutOff = 0.3; mat.backFaceCulling = false; mat.metallic = 0; mat.roughness = 0.9;
+  const cards = [0, 1, 2].map(i => { const p = BABYLON.MeshBuilder.CreatePlane("gc", { width: 0.7, height: 0.45 }, scene); p.position.y = 0.22; p.rotation.y = i * Math.PI / 3; return p; });
+  const clump = BABYLON.Mesh.MergeMeshes(cards, true); clump.name = "grassClump"; clump.material = mat;
+  const mats = [];
+  const q = new BABYLON.Quaternion();
+  for (let i = 0; i < 14000; i++) {
+    // dense where the camera looks (open ground beyond both ends of the lists), sparse across the rest of the field
+    const nearEnds = i % 10 < 8, end = Math.random() < 0.5 ? 1 : -1;
+    const x = nearEnds ? (Math.random() - 0.5) * 80 : (Math.random() - 0.5) * 220;
+    const z = nearEnds ? end * (LIST_LEN / 2 + 4 + Math.random() * 60) : (Math.random() - 0.5) * 420;
+    if (Math.abs(x) < STAND_X + TIERS * TIER_D + 1 && Math.abs(z) < LIST_LEN / 2 + 4) continue; // not inside the lists/stands
+    if (Math.abs(z - 150) < 10 && Math.abs(x) < 60) continue; // keep the curtain wall's footprint clear
+    BABYLON.Quaternion.RotationYawPitchRollToRef(Math.random() * 6.3, 0, 0, q);
+    const s = 0.7 + Math.random() * 0.8;
+    mats.push(BABYLON.Matrix.Compose(V3(s, s * (0.8 + Math.random() * 0.5), s), q, V3(x, 0, z)));
+  }
+  const buf = new Float32Array(mats.length * 16); mats.forEach((m, i) => m.copyToArray(buf, i * 16));
+  clump.thinInstanceSetBuffer("matrix", buf, 16); clump.thinInstanceRefreshBoundingInfo();
+})();
+
+// --- Photoscanned props (Poly Haven, CC0; packed by scripts/blender/pack_props.py)
+// Each entry: [model, x, z, rotationY, scale]. Squires' camps at both ends, water by the walls, greenery outside.
+const PROP_LAYOUT = {
+  wooden_barrels_01: [[-5.5, 72, 0.4, 1], [5.2, -73, 2.6, 1]],
+  wine_barrel_01: [[-7.6, 30, 0, 1], [7.6, -24, 1, 1], [-7.6, -46, 2, 1], [7.6, 52, 0.5, 1], [-3.8, 74, 1, 1]],
+  wooden_bucket_01: [[-7.4, 31.2, 0, 1], [7.4, -22.9, 0, 1], [6.8, -74, 0, 1], [-4.6, 75.5, 0, 1]],
+  wooden_crate_01: [[4.2, 73, 0.3, 1], [4.6, 73.9, 1.2, 1], [-4.8, -72, 0.7, 1]],
+  wooden_crate_02: [[3.4, 72.4, 0.1, 1], [-5.9, -73.2, 1.9, 1]],
+  painted_wooden_bench: [[0, 76, 0, 1.1], [-1.6, -76, Math.PI, 1.1], [1.6, -76, Math.PI, 1.1]],
+  wooden_ladder: [[-6.6, 77, 0.2, 1.3]],
+  wooden_lantern_01: [[0.6, 76.2, 0, 1], [-1.0, -76.2, 0, 1]],
+  tree_stump_01: [[-24, 40, 0.5, 1.2], [26, -60, 2, 1], [-30, -20, 1, 1.4]],
+  boulder_01: [[-28, 60, 0.3, 1.5], [30, 10, 1.6, 1.2], [-22, -70, 2.2, 1.8]],
+  grass_medium_01: [], shrub_03: [],
+  curtain: [[0, 150, 0, 1]],  // photoscanned curtain wall + gatehouse tower closing the far end of the field
+};
+for (let i = 0; i < 70; i++) {  // tufts of grass and low shrubs scattered round the outside of the stands and tents
+  const side = i % 2 ? 1 : -1, x = side * (25 + Math.random() * 30), z = (Math.random() - 0.5) * 220;
+  (i % 3 ? PROP_LAYOUT.grass_medium_01 : PROP_LAYOUT.shrub_03).push([x, z, Math.random() * 6, 0.8 + Math.random() * 0.6]);
+}
+Object.entries(PROP_LAYOUT).forEach(([name, spots]) => {
+  if (!spots.length) return;
+  BABYLON.SceneLoader.LoadAssetContainerAsync("assets/props/", name + ".glb", scene).then(c => {
+    for (const [x, z, ry, s] of spots) {
+      const inst = c.instantiateModelsToScene(n => n, false); // shared geometry: instances, not copies
+      const root = inst.rootNodes[0];
+      root.position.set(x, 0, z); root.rotation = V3(0, ry, 0); root.rotationQuaternion = null; root.scaling.scaleInPlace(s);
+      for (const m of root.getChildMeshes()) {
+        m.receiveShadows = true;
+        if (Math.abs(z) < TRACK_HALF + 20 && Math.abs(x) < 12) shadows.addShadowCaster(m);
+      }
+    }
+  }).catch(e => console.warn("prop", name, e.message));
+});
+
+// --- A rider = mount (moves) + horse + armoured knight + lance. dir +1 rides toward +z, -1 toward -z.
+// Lance is in the right hand and crosses the horse's neck to the left; shield on the left, facing the tilt.
+const UP = V3(0, 1, 0);
+function makeRider(name, laneX, dir, arms) {
+  const steel = pbr(name + "steel", [0.78, 0.79, 0.8], 1, 0.28);
+  const darkSteel = pbr(name + "darkSteel", [0.05, 0.05, 0.06], 0.8, 0.5);
+  const leather = pbr(name + "leather", [0.32, 0.18, 0.09], 0, 0.6);
+  const heraldry = painted(name + "arms", 256, 256, drawArms(arms));
+  const coat = pbr(name + "coat", BABYLON.Color3.FromHexString(arms.field).asArray(), 0, 0.85);
+  const r = { name, dir, laneX, speed: 0, score: 0, gallop: null, recoil: 0, yaw: -0.6, pitch: 0.05,
+              guard: 0, guardHeld: 0, guardCooldown: 0, wantGuard: false };
+  r.mount = new BABYLON.TransformNode(name, scene);
+  r.mount.rotation.y = dir > 0 ? 0 : Math.PI;
+  r.horseHolder = new BABYLON.TransformNode(name + "horse", scene); r.horseHolder.parent = r.mount;
+  r.knight = new BABYLON.TransformNode(name + "knight", scene); r.knight.parent = r.mount;
+  const part = (mesh, m, x, y, z, parent = r.knight) => {
+    mesh.parent = parent; mesh.material = m; mesh.position.set(x, y, z);
+    shadows.addShadowCaster(mesh); mesh.receiveShadows = true; return mesh;
+  };
+  // Limb segment between two points (knight-local)
+  const limb = (a, b, radius, m) => {
+    const d = b.subtract(a), seg = BABYLON.MeshBuilder.CreateCapsule("limb", { radius, height: d.length() + radius * 2, tessellation: 10 }, scene);
+    part(seg, m, ...a.add(b).scale(0.5).asArray());
+    seg.rotationQuaternion = BABYLON.Quaternion.Identity();
+    BABYLON.Quaternion.FromUnitVectorsToRef(UP, d.normalize(), seg.rotationQuaternion);
+    return seg;
+  };
+  const sphere = (d, m, x, y, z, sx = 1, sy = 1, sz = 1) => {
+    const s = part(BABYLON.MeshBuilder.CreateSphere("s", { diameter: d, segments: 16 }, scene), m, x, y, z);
+    s.scaling.set(sx, sy, sz); return s;
+  };
+  // Saddle with high cantle (jousting saddle)
+  part(BABYLON.MeshBuilder.CreateBox("saddle", { width: 0.42, height: 0.08, depth: 0.6 }, scene), leather, 0, -0.02, 0);
+  part(BABYLON.MeshBuilder.CreateBox("cantle", { width: 0.38, height: 0.3, depth: 0.06 }, scene), leather, 0, 0.13, -0.3);
+  // Torso: breastplate + fauld + tabard with arms
+  r.torso = sphere(1, steel, 0, 0.5, 0, 0.44, 0.62, 0.34);
+  part(BABYLON.MeshBuilder.CreateCylinder("fauld", { diameterTop: 0.42, diameterBottom: 0.52, height: 0.22, tessellation: 20 }, scene), steel, 0, 0.13, 0).scaling.z = 0.75;
+  for (const z of [0.17, -0.17]) part(BABYLON.MeshBuilder.CreateBox("tabard", { width: 0.4, height: 0.44, depth: 0.015 }, scene), heraldry, 0, 0.3, z);
+  // Head: gorget + great helm with visor slit + crest
+  part(BABYLON.MeshBuilder.CreateCylinder("gorget", { diameterTop: 0.18, diameterBottom: 0.26, height: 0.1, tessellation: 16 }, scene), steel, 0, 0.84, 0);
+  // Close helm: rounded skull, pointed "sparrow-beak" visor with eye slit, bevor over the chin, roped comb
+  sphere(1, steel, 0, 1.07, -0.01, 0.28, 0.31, 0.31);
+  sphere(1, steel, 0, 1.05, 0.07, 0.22, 0.2, 0.3);
+  sphere(1, steel, 0, 0.95, 0.04, 0.27, 0.19, 0.28);
+  part(BABYLON.MeshBuilder.CreateBox("eyeSlit", { width: 0.17, height: 0.018, depth: 0.03 }, scene), darkSteel, 0, 1.085, 0.205);
+  part(BABYLON.MeshBuilder.CreateBox("comb", { width: 0.018, height: 0.05, depth: 0.3 }, scene), steel, 0, 1.23, -0.01);
+  sphere(0.3, coat, 0, 1.3, -0.12, 0.3, 0.5, 0.9).rotation.x = -0.5; // plume
+  // Shoulders and arms
+  for (const s of [-1, 1]) sphere(0.24, steel, s * 0.25, 0.78, 0, 1, 0.75, 1.1);
+  sphere(1, steel, -0.22, 0.72, 0.09, 0.14, 0.34, 0.3).rotation.y = -0.4; // grand guard (tilting plate) on the left
+  // Mail skirt below the fauld
+  const mail = pbr(name + "mail", [0.35, 0.36, 0.38], 0.9, 0.55);
+  part(BABYLON.MeshBuilder.CreateCylinder("mailSkirt", { diameterTop: 0.5, diameterBottom: 0.62, height: 0.26, tessellation: 20 }, scene), mail, 0, -0.04, 0).scaling.z = 0.8;
+  limb(V3(0.27, 0.72, 0), V3(0.33, 0.48, -0.1), 0.06, steel);       // right upper arm (lance arm, couched)
+  limb(V3(0.33, 0.48, -0.1), V3(0.3, 0.45, 0.12), 0.055, steel);    // right forearm to the grip
+  sphere(0.11, darkSteel, 0.3, 0.45, 0.12);                          // gauntlet
+  limb(V3(-0.27, 0.72, 0), V3(-0.3, 0.52, 0.05), 0.06, steel);       // left upper arm
+  // Legs straddling the horse
+  for (const s of [-1, 1]) {
+    limb(V3(s * 0.14, 0.12, 0.05), V3(s * 0.3, -0.08, 0.3), 0.075, steel);  // thigh
+    limb(V3(s * 0.3, -0.08, 0.3), V3(s * 0.3, -0.55, 0.12), 0.06, steel);   // greave
+    part(BABYLON.MeshBuilder.CreateBox("sabaton", { width: 0.1, height: 0.07, depth: 0.25 }, scene), steel, s * 0.3, -0.6, 0.2);
+  }
+  // Shield: heater-shaped, painted with the arms. r.shield is the node moved by the guard animation.
+  r.shield = new BABYLON.TransformNode(name + "shield", scene);
+  r.shield.parent = r.knight; r.shield.position.set(-0.33, 0.55, 0.1); r.shield.rotation.y = 0.35;
+  const outline = [V3(0.3, 0, -0.23), V3(0.3, 0, 0.23), V3(0.05, 0, 0.23), V3(-0.14, 0, 0.13), V3(-0.3, 0, 0), V3(-0.14, 0, -0.13), V3(0.05, 0, -0.23)];
+  r.shieldMesh = BABYLON.MeshBuilder.ExtrudePolygon("shieldMesh", { shape: outline, depth: 0.04, sideOrientation: BABYLON.Mesh.DOUBLESIDE }, scene, earcut);
+  part(r.shieldMesh, heraldry, 0, 0, 0, r.shield);
+  r.shieldMesh.rotation.z = -Math.PI / 2; // shape's +y face → facing outward (−x), point of the shield down
+  // Lance: painted shaft, steel vamplate (hand guard) and a crown-shaped coronel tip
+  r.pivot = new BABYLON.TransformNode(name + "pivot", scene); r.pivot.parent = r.knight; r.pivot.position.set(0.3, 0.45, 0.1);
+  const lance = r.lance = BABYLON.MeshBuilder.CreateCylinder("lance", { diameterTop: 0.045, diameterBottom: 0.12, height: LANCE_LEN, tessellation: 12 }, scene);
+  // Barber-pole spiral: diagonal bands wrap into a spiral round the shaft
+  part(lance, painted(name + "lanceSpiral", 128, 128, (g, w, h) => {
+    g.fillStyle = "#efe8d8"; g.fillRect(0, 0, w, h); g.fillStyle = arms.field;
+    for (let k = -2; k < 3; k++) { g.beginPath(); g.moveTo(k * w, 0); g.lineTo(k * w + w * 0.5, 0); g.lineTo(k * w + w * 1.5, h); g.lineTo(k * w + w, h); g.fill(); }
+  }, 1, 6), 0, 0, LANCE_LEN / 2 - 0.6, r.pivot);
+  lance.rotation.x = Math.PI / 2;
+  const vamplate = part(BABYLON.MeshBuilder.CreateCylinder("vamplate", { diameterTop: 0.06, diameterBottom: 0.3, height: 0.28, tessellation: 20 }, scene), steel, 0, 0, 0.25, r.pivot);
+  vamplate.rotation.x = -Math.PI / 2;
+  r.tip = part(BABYLON.MeshBuilder.CreateCylinder("coronel", { diameterTop: 0.11, diameterBottom: 0.05, height: 0.1, tessellation: 6 }, scene), darkSteel, 0, 0, LANCE_LEN - 0.6, r.pivot);
+  r.tip.rotation.x = Math.PI / 2;
+  return r;
+}
+const player = makeRider("player", LANE, 1, ARMS.player);
+const bot = makeRider("bot", -LANE, -1, ARMS.bot);
+const riders = [player, bot];
+
+// --- Camera: chase cam behind the player, offset to the outside so the lance and opponent are visible
+const camera = new BABYLON.UniversalCamera("cam", BABYLON.Vector3.Zero(), scene);
+camera.minZ = 0.1; camera.maxZ = 3000; camera.fov = 0.82;
+// Film-like tone mapping, MSAA, light vignette
+const pipeline = new BABYLON.DefaultRenderingPipeline("pp", true, scene, [camera]);
+pipeline.samples = 4;
+pipeline.imageProcessingEnabled = true;
+pipeline.imageProcessing.toneMappingEnabled = true;
+pipeline.imageProcessing.toneMappingType = BABYLON.ImageProcessingConfiguration.TONEMAPPING_ACES;
+pipeline.imageProcessing.exposure = 1.1; pipeline.imageProcessing.contrast = 1.15;
+pipeline.imageProcessing.vignetteEnabled = true; pipeline.imageProcessing.vignetteWeight = 1.2;
+// Photographic finish: highlight bloom on polished steel, fine film grain, a touch of lens fringing, crisp detail
+pipeline.bloomEnabled = true; pipeline.bloomThreshold = 1.1; pipeline.bloomWeight = 0.15; pipeline.bloomKernel = 48;
+pipeline.grainEnabled = true; pipeline.grain.intensity = 5; pipeline.grain.animated = true;
+pipeline.chromaticAberrationEnabled = true; pipeline.chromaticAberration.aberrationAmount = 3; pipeline.chromaticAberration.radialIntensity = 0.6;
+pipeline.sharpenEnabled = true; pipeline.sharpen.edgeAmount = 0.25;
+// Ambient occlusion grounds objects in soft contact shadows (desktop only: too costly for phones)
+const isPhone = matchMedia("(pointer: coarse)").matches;
+if (!isPhone && BABYLON.SSAO2RenderingPipeline.IsSupported) {
+  const ssao = new BABYLON.SSAO2RenderingPipeline("ssao", scene, { ssaoRatio: 0.5, blurRatio: 0.5 }, [camera]);
+  ssao.radius = 1.2; ssao.totalStrength = 1.1; ssao.samples = 12; ssao.maxZ = 120; ssao.expensiveBlur = false;
+}
+const camOffset = new BABYLON.Vector3(1.9, 2.75, -5.2);
+
+// --- Sound: everything synthesised with Web Audio (no files). Browsers only allow audio after a key/click,
+// so the context starts on the first input. M toggles mute.
+const sfx = (() => {
+  let ctx = null, master = null, noise = null, crowdGain = null, muted = false;
+  function init() {
+    if (ctx) return;
+    ctx = new (window.AudioContext || window.webkitAudioContext)();
+    const comp = ctx.createDynamicsCompressor(); comp.connect(ctx.destination);
+    master = ctx.createGain(); master.gain.value = 0.8; master.connect(comp);
+    noise = ctx.createBuffer(1, ctx.sampleRate * 2, ctx.sampleRate);
+    const d = noise.getChannelData(0); for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
+    // Crowd bed: two bands of looping noise (murmur + brighter voices), level follows excitement
+    crowdGain = ctx.createGain(); crowdGain.gain.value = 0.04; crowdGain.connect(master);
+    for (const [f, q, g] of [[350, 0.6, 1], [1100, 0.9, 0.5]]) {
+      const src = ctx.createBufferSource(); src.buffer = noise; src.loop = true;
+      const bp = ctx.createBiquadFilter(); bp.type = "bandpass"; bp.frequency.value = f; bp.Q.value = q;
+      const lvl = ctx.createGain(); lvl.gain.value = g;
+      src.connect(bp).connect(lvl).connect(crowdGain); src.start();
+    }
+  }
+  const out = (gain, pan) => { // a voice's gain → stereo pan → master
+    const g = ctx.createGain(); g.gain.value = 0;
+    const p = ctx.createStereoPanner(); p.pan.value = Math.max(-1, Math.min(1, pan || 0));
+    g.connect(p).connect(master); return g;
+  };
+  function burst(t, { dur = 0.1, gain = 0.5, type = "lowpass", freq = 400, q = 0.7, pan = 0, attack = 0.003 }) {
+    const src = ctx.createBufferSource(); src.buffer = noise;
+    const f = ctx.createBiquadFilter(); f.type = type; f.frequency.value = freq; f.Q.value = q;
+    const g = out(gain, pan);
+    g.gain.setValueAtTime(0, t); g.gain.linearRampToValueAtTime(gain, t + attack); g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    src.connect(f).connect(g); src.start(t, Math.random() * 1.5, dur + 0.05);
+  }
+  function tone(t, { freq, dur, gain = 0.3, type = "sine", pan = 0, slide = 1, attack = 0.002 }) {
+    const o = ctx.createOscillator(); o.type = type; o.frequency.setValueAtTime(freq, t);
+    if (slide !== 1) o.frequency.exponentialRampToValueAtTime(freq * slide, t + dur);
+    const g = out(gain, pan);
+    g.gain.setValueAtTime(0, t); g.gain.linearRampToValueAtTime(gain, t + attack); g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    o.connect(g); o.start(t); o.stop(t + dur + 0.05);
+  }
+  return {
+    init, get ready() { return !!ctx && !muted; },
+    toggleMute() { muted = !muted; if (master) master.gain.value = muted ? 0 : 0.8; return muted; },
+    hoof(vol, pan) { // a hoof striking packed sand: dull thump plus a gritty scuff
+      if (!this.ready || vol < 0.01) return; const t = ctx.currentTime;
+      tone(t, { freq: 85, dur: 0.09, gain: 0.5 * vol, pan, slide: 0.6 });
+      burst(t, { dur: 0.07, gain: 0.35 * vol, freq: 700, pan });
+    },
+    crowd(level) { if (crowdGain && ctx) crowdGain.gain.setTargetAtTime(muted ? 0 : 0.03 + level * 0.35, ctx.currentTime, 0.25); },
+    lance(broke, pan) { // wood on steel: a sharp crack; a break adds a splintering crackle
+      if (!this.ready) return; const t = ctx.currentTime;
+      burst(t, { dur: 0.18, gain: 0.9, type: "highpass", freq: 1400, pan });
+      tone(t, { freq: 190, dur: 0.12, gain: 0.5, type: "triangle", pan, slide: 0.7 });
+      if (broke) for (let i = 0; i < 9; i++) burst(t + 0.02 + Math.random() * 0.25, { dur: 0.04 + Math.random() * 0.05, gain: 0.35, type: "bandpass", freq: 1500 + Math.random() * 2500, q: 2, pan });
+    },
+    clang(strength, pan) { // struck plate armour: inharmonic ringing partials
+      if (!this.ready) return; const t = ctx.currentTime;
+      for (const [f, d] of [[523, 0.9], [1187, 0.6], [1832, 0.45], [2711, 0.3]]) tone(t, { freq: f * (0.97 + Math.random() * 0.06), dur: d, gain: 0.12 * strength, pan });
+      burst(t, { dur: 0.05, gain: 0.4 * strength, type: "highpass", freq: 3000, pan });
+    },
+    thud(pan) { // a knight in armour hitting the ground
+      if (!this.ready) return; const t = ctx.currentTime;
+      tone(t, { freq: 60, dur: 0.35, gain: 0.9, pan, slide: 0.5 });
+      burst(t, { dur: 0.3, gain: 0.6, freq: 250, pan });
+      this.clang(0.6, pan);
+    },
+    fanfare() { // herald's trumpet: ta-ta-taaa, brassy saw through a low-pass with a little vibrato
+      if (!this.ready) return; const t0 = ctx.currentTime + 0.05;
+      for (const [f, s, d] of [[392, 0, 0.16], [392, 0.2, 0.16], [523, 0.4, 0.75]]) {
+        const o = ctx.createOscillator(); o.type = "sawtooth"; o.frequency.value = f;
+        const vib = ctx.createOscillator(); vib.frequency.value = 5.5; const vg = ctx.createGain(); vg.gain.value = 4;
+        vib.connect(vg).connect(o.frequency);
+        const lp = ctx.createBiquadFilter(); lp.type = "lowpass"; lp.frequency.value = 1600; lp.Q.value = 1.2;
+        const g = out(0, 0.3), t = t0 + s;
+        g.gain.setValueAtTime(0, t); g.gain.linearRampToValueAtTime(0.18, t + 0.03); g.gain.setValueAtTime(0.18, t + d - 0.05); g.gain.linearRampToValueAtTime(0, t + d);
+        o.connect(lp).connect(g); o.start(t); vib.start(t); o.stop(t + d + 0.05); vib.stop(t + d + 0.05);
+      }
+    },
+  };
+})();
+const unlockAudio = () => { const fresh = !sfx.ready; sfx.init(); if (fresh && state === "ready") sfx.fanfare(); };
+addEventListener("keydown", unlockAudio, { once: true }); addEventListener("pointerdown", unlockAudio, { once: true });
+addEventListener("keydown", e => { if (e.code === "KeyM") sfx.toggleMute(); });
+// Where a sound sits for the listener (the chase camera): quieter with distance, panned left/right
+function earOf(pos) {
+  const d = BABYLON.Vector3.Distance(camera.position, pos);
+  const right = camera.getDirection(BABYLON.Axis.X), rel = pos.subtract(camera.position).normalize();
+  return { vol: Math.min(1, 6 / (d + 2)), pan: BABYLON.Vector3.Dot(right, rel) };
+}
+
+// --- Input
+const keys = {};
+addEventListener("keydown", e => { keys[e.code] = true; if (e.code === "KeyR" && state === "done") newMatch(); });
+addEventListener("keyup", e => keys[e.code] = false);
+let rightMouse = false;
+canvas.addEventListener("pointerdown", e => { if (e.button === 2) rightMouse = true; });
+addEventListener("pointerup", e => { if (e.button === 2) rightMouse = false; });
+canvas.addEventListener("contextmenu", e => e.preventDefault());
+let aimX = 0, aimY = 0; // -1..1
+canvas.addEventListener("pointermove", e => {
+  const r = canvas.getBoundingClientRect();
+  aimX = ((e.clientX - r.left) / r.width) * 2 - 1;
+  aimY = ((e.clientY - r.top) / r.height) * 2 - 1;
+});
+
+const hud = document.getElementById("hud"), scoreEl = document.getElementById("score"), msgEl = document.getElementById("msg");
+let msgTimer = 0;
+function say(text, ms = 1200) { msgEl.textContent = text; msgEl.style.opacity = 1; clearTimeout(msgTimer); if (ms) msgTimer = setTimeout(() => msgEl.style.opacity = 0, ms); }
+
+// --- Match state: ready → riding → (between → ready) … → done
+let state = "loading", pass = 1, betweenT = 0, botTargetSpeed = 11, botAimError = BABYLON.Vector3.Zero();
+
+function resetPass() {
+  for (const r of riders) {
+    r.mount.position.set(r.laneX, 0, -r.dir * (TRACK_HALF - 5));
+    r.speed = 0; r.resolved = false; r.prevSide = null; r.recoil = 0;
+    r.guard = 0; r.guardHeld = 0; r.guardCooldown = 0; r.wantGuard = false;
+    remount(r);
+    setLanceLength(r, 1); // squire hands over a fresh lance
+  }
+  // Bot plan for this pass: what to aim at, and when (time-to-impact) to raise the shield.
+  // A plan above GUARD_MAX raises too early and the arm tires before impact — a bot mistake.
+  bot.aimAt = Math.random() < 0.4 ? "torso" : "shield";
+  bot.guardAtTTI = Math.random() < 0.6 ? 0.3 + Math.random() * 1.3 : -1;
+  botTargetSpeed = 9.5 + Math.random() * 3.5;
+  const g = () => (Math.random() + Math.random() + Math.random() - 1.5) * BOT_AIM_ERROR * 1.4; // ~gaussian
+  botAimError = new BABYLON.Vector3(g(), g(), 0);
+  camera.position = player.mount.position.add(camOffset);
+  state = "ready";
+  sfx.fanfare(); // the herald calls each pass
+}
+function newMatch() { pass = 1; for (const r of riders) r.score = 0; msgEl.style.opacity = 0; resetPass(); }
+
+// Hit check when the attacker's lance tip crosses the defender's body plane (robust at 25+ m/s closing speed)
+// The unhorsed knight leaves the saddle: thrown back and outward, tumbling, lands on his back in a puff of sand
+function startFall(r, att) {
+  r.knight.setParent(null); // keep world pose, stop following the horse
+  if (!r.knight.rotationQuaternion) r.knight.rotationQuaternion = BABYLON.Quaternion.FromEulerVector(r.knight.rotation);
+  const out = Math.sign(r.laneX); // away from the tilt
+  r.fall = { v: V3(out * 2.2, 2.4, r.dir * r.speed * 0.45 + att.dir * 1.5), spin: -3.2, pitch: 0, landed: false };
+  r.unhorsed = true;
+}
+function updateFall(r, dt) {
+  const f = r.fall;
+  if (f.landed) return;
+  f.v.y -= 9.8 * dt;
+  r.knight.position.addInPlace(f.v.scale(dt));
+  f.pitch = Math.max(-Math.PI / 2, f.pitch + f.spin * dt);  // tips over backwards
+  const yaw = r.dir > 0 ? 0 : Math.PI;
+  r.knight.rotationQuaternion = BABYLON.Quaternion.RotationYawPitchRoll(yaw, f.pitch, Math.sign(r.laneX) * f.pitch * 0.3);
+  if (r.knight.position.y <= 0.28 && f.v.y < 0) {
+    f.landed = true; r.knight.position.y = 0.28;
+    sfx.thud(earOf(r.knight.position).pan);
+    r.knight.rotationQuaternion = BABYLON.Quaternion.RotationYawPitchRoll(yaw, -Math.PI / 2, Math.sign(r.laneX) * 0.25);
+    const puff = new BABYLON.ParticleSystem("landingDust", 80, scene);
+    puff.particleTexture = dustTex; puff.emitter = r.knight.position.clone();
+    puff.minEmitBox = V3(-0.5, 0, -0.8); puff.maxEmitBox = V3(0.5, 0.1, 0.8);
+    puff.direction1 = V3(-1.5, 0.6, -1.5); puff.direction2 = V3(1.5, 1.4, 1.5);
+    puff.minSize = 0.5; puff.maxSize = 1.6; puff.minLifeTime = 1; puff.maxLifeTime = 2.4;
+    puff.color1 = new BABYLON.Color4(0.78, 0.68, 0.52, 0.45); puff.color2 = new BABYLON.Color4(0.7, 0.6, 0.45, 0.3);
+    puff.colorDead = new BABYLON.Color4(0.7, 0.6, 0.45, 0); puff.gravity = V3(0, 0.1, 0);
+    puff.manualEmitCount = 70; puff.targetStopDuration = 2.5; puff.disposeOnStop = true; puff.start();
+  }
+}
+function remount(r) {
+  if (!r.fall) return;
+  r.knight.setParent(r.mount);
+  r.knight.rotationQuaternion = null; r.knight.rotation.set(0, 0, 0);
+  r.knight.position.set(0, r.seatY, SEAT.z);
+  r.fall = null; r.unhorsed = false;
+}
+
+function resolveHit(att, def) {
+  if (att.resolved) return;
+  const side = Math.sign(att.tip.getAbsolutePosition().z - def.knight.getAbsolutePosition().z) * att.dir;
+  if (att.prevSide === -1 && side >= 0) {
+    att.resolved = true;
+    const tip = att.tip.getAbsolutePosition(), s = def.shield.getAbsolutePosition(), t = def.torso.getAbsolutePosition();
+    let pts = 0, what = "Miss", off = 1; // off: 0 = dead centre, 1 = edge of the hit zone
+    const bdx = Math.abs(tip.x - t.x) / 0.2, bdy = Math.abs(tip.y - t.y) / 0.3;
+    const sdx = Math.abs(tip.x - s.x) / 0.35, sdy = Math.abs(tip.y - s.y) / 0.32;
+    if (bdx < 1 && bdy < 1) { pts = 2; what = "Body hit +2"; off = Math.max(bdx, bdy); }
+    else if (sdx < 1 && sdy < 1) { pts = 1; what = "Shield hit +1"; off = Math.max(sdx, sdy); }
+    if (pts === 2 && def.guard > 0.8) { pts = 1; what = "Blocked — shield +1"; }
+    const body = pts === 2;
+    // Unhorsing: an unguarded, dead-centre body hit at full tilt knocks the rider out of the saddle — instant win
+    const unhorse = body && att.speed >= DISMOUNT_SPEED && off < DISMOUNT_CENTRE;
+    const broke = pts && att.speed >= BREAK_SPEED && off < BREAK_CENTRE;
+    if (broke) { pts += 1; what += ", lance broke +1"; shatter(att); }
+    if (pts) { const ear = earOf(def.knight.getAbsolutePosition()); sfx.lance(broke, ear.pan); sfx.clang(body ? 1 : 0.6, ear.pan); }
+    att.score += pts;
+    if (pts) { def.recoil = body ? 0.45 : 0.25; flash(body ? def.bodyFlash || def.torso : def.shieldMesh); crowd.excite = 1; }
+    if (unhorse) { what = "UNHORSED the rider!"; startFall(def, att); }
+    att.lastResult = what;
+  }
+  att.prevSide = side;
+}
+// Lance length as a fraction; the butt stays in the hand, the tip only shows on a whole lance
+function setLanceLength(r, f) {
+  r.lance.scaling.y = f;
+  r.lance.position.z = (LANCE_LEN * f) / 2 - 0.6;
+  r.tip.isVisible = f === 1;
+}
+const splinters = [];
+function shatter(r) {
+  const at = r.tip.getAbsolutePosition().clone();
+  setLanceLength(r, 0.35);
+  for (let i = 0; i < 12; i++) {
+    const m = BABYLON.MeshBuilder.CreateBox("splinter", { width: 0.04, height: 0.04, depth: 0.15 + Math.random() * 0.45 }, scene);
+    m.material = r.lance.material; m.position.copyFrom(at);
+    m.rotation.set(Math.random() * 3, Math.random() * 3, 0);
+    splinters.push({ m, life: 1.6,
+      v: new BABYLON.Vector3((Math.random() - 0.5) * 6, 2 + Math.random() * 4, r.dir * r.speed * 0.4 + (Math.random() - 0.5) * 4),
+      spin: new BABYLON.Vector3(Math.random() * 12, Math.random() * 12, 0) });
+  }
+}
+function updateSplinters(dt) {
+  for (let i = splinters.length - 1; i >= 0; i--) {
+    const s = splinters[i];
+    s.v.y -= 9.8 * dt;
+    s.m.position.addInPlace(s.v.scale(dt));
+    if (s.m.position.y < 0.03) { s.m.position.y = 0.03; s.v.scaleInPlace(0.4); s.v.y = Math.abs(s.v.y) * 0.3; }
+    s.m.rotation.addInPlace(s.spin.scale(dt));
+    if ((s.life -= dt) <= 0) { s.m.dispose(); splinters.splice(i, 1); }
+  }
+}
+function flash(mesh) {
+  mesh.material.emissiveColor = new BABYLON.Color3(1, 0.8, 0.2);
+  setTimeout(() => mesh.material.emissiveColor = BABYLON.Color3.Black(), 400);
+}
+
+// Guard state machine + shield pose. Shield swings from the side to cover the chest.
+const SHIELD_REST = { x: -0.33, y: 0.55, z: 0.1, ry: 0.35 }, SHIELD_UP = { x: -0.12, y: 0.6, z: 0.32, ry: 0.85 };
+function updateGuard(r, dt) {
+  let want = r.wantGuard;
+  if (r.guardCooldown > 0) { r.guardCooldown -= dt; want = false; }
+  if (want) { r.guardHeld += dt; if (r.guardHeld > GUARD_MAX) { r.guardCooldown = GUARD_COOLDOWN; r.guardHeld = 0; want = false; } }
+  else r.guardHeld = 0;
+  r.guard += ((want ? 1 : 0) - r.guard) * Math.min(1, dt * 10);
+  const g = r.guard, lerp = (a, b) => a + (b - a) * g;
+  r.shield.position.set(lerp(SHIELD_REST.x, SHIELD_UP.x), lerp(SHIELD_REST.y, SHIELD_UP.y), lerp(SHIELD_REST.z, SHIELD_UP.z));
+  r.shield.rotation.y = lerp(SHIELD_REST.ry, SHIELD_UP.ry);
+}
+// Seconds until the two knights meet (negative once they've passed)
+function timeToImpact() {
+  return (bot.mount.position.z - player.mount.position.z) / Math.max(0.1, player.speed + bot.speed);
+}
+
+// Bot aims its lance at the player's shield or body (chosen per pass), plus per-pass scatter
+function botAim(dt) {
+  const aimWorld = (bot.aimAt === "torso" ? player.torso : player.shield).getAbsolutePosition().add(botAimError);
+  const inv = bot.knight.getWorldMatrix().clone().invert();
+  const rel = BABYLON.Vector3.TransformCoordinates(aimWorld, inv).subtract(bot.pivot.position);
+  const L = bot.tip.position.z, clamp = v => BABYLON.Scalar.Clamp(v, -1, 1);
+  const pitch = Math.asin(clamp(-rel.y / L));
+  const yaw = Math.asin(clamp(rel.x / (L * Math.cos(pitch))));
+  const k = Math.min(1, dt * 3);
+  bot.yaw += (yaw - bot.yaw) * k; bot.pitch += (pitch - bot.pitch) * k;
+}
+
+// Caparison: a draped cloth (dome over the back, skirt to the knees) whose vertices are animated each
+// frame — the hem trails back and lifts with speed, billows out, and ripples with the gallop.
+// shortcut: procedural motion, not a cloth simulation; switch to Havok cloth if it ever needs to collide with legs.
+const CAPA_AROUND = 48;
+function makeCaparison(name, top, bottom) {
+  const W = BODY.width / 2, L = BODY.length / 2;
+  // rows: [radius factor, height, skirt factor 0..1 (how free the cloth is)]
+  const rows = [[0.3, top + 0.03, 0], [1.0, top - 0.05, 0]];
+  for (let i = 1; i <= 7; i++) { const h = i / 7; rows.push([1 + 0.1 * h, top - 0.05 + (bottom - top + 0.05) * h, h]); }
+  const paths = rows.map(([rf, y]) => {
+    const ring = [];
+    for (let k = 0; k <= CAPA_AROUND; k++) { const a = (k / CAPA_AROUND) * Math.PI * 2; ring.push(V3(W * rf * Math.cos(a), y, BODY.z + L * rf * Math.sin(a))); }
+    return ring;
+  });
+  const mesh = BABYLON.MeshBuilder.CreateRibbon(name + "caparison", { pathArray: paths, updatable: true, sideOrientation: BABYLON.Mesh.DOUBLESIDE }, scene);
+  const base = Float32Array.from(mesh.getVerticesData(BABYLON.VertexBuffer.PositionKind));
+  // per-vertex skirt factor and angle round the body (ribbon vertices go path by path)
+  const n = base.length / 3, free = new Float32Array(n), ang = new Float32Array(n);
+  let i = 0;
+  for (const [, , f] of rows) for (let k = 0; k <= CAPA_AROUND; k++, i++) { free[i] = f; ang[i] = (k / CAPA_AROUND) * Math.PI * 2; }
+  mesh.cloth = { base, free, ang, pos: new Float32Array(base), normals: new Float32Array(base.length), indices: mesh.getIndices() };
+  return mesh;
+}
+function flowCaparison(mesh, sp, now, speed) {
+  const { base, free, ang, pos, normals, indices } = mesh.cloth;
+  const ripplePhase = now * (4 + speed * 1.1), bounce = Math.sin(now * (3 + speed));
+  for (let i = 0; i < free.length; i++) {
+    const f = free[i], f2 = f * f, a = ang[i], j = i * 3;
+    const billow = 1 + 0.07 * f2 * sp;
+    const ripple = Math.sin(a * 7 + ripplePhase) * 0.025 * f2 * (0.25 + sp);
+    pos[j] = base[j] * billow + Math.cos(a) * ripple;
+    pos[j + 1] = base[j + 1] + f2 * sp * (0.07 + 0.035 * bounce);
+    pos[j + 2] = BODY.z + (base[j + 2] - BODY.z) * billow + Math.sin(a) * ripple - 0.25 * Math.pow(f, 1.6) * sp; // hem trails back
+  }
+  mesh.updateVerticesData(BABYLON.VertexBuffer.PositionKind, pos);
+  BABYLON.VertexData.ComputeNormals(pos, indices, normals);
+  mesh.updateVerticesData(BABYLON.VertexBuffer.NormalKind, normals);
+}
+
+// Horse and knight are built in Blender by scripts/blender/build_*.py (metres, seat at knight origin)
+const SEAT = { y: 1.6, z: 0.15 }, BODY = { z: -0.05, length: 1.62, width: 0.78 };
+// Hoof dust: soft sand-coloured puffs thrown up behind each horse, more the faster it runs
+const dustTex = new BABYLON.DynamicTexture("dustTex", 64, scene, false);
+(g => { const r = g.createRadialGradient(32, 32, 2, 32, 32, 31); r.addColorStop(0, "rgba(255,255,255,0.9)"); r.addColorStop(1, "rgba(255,255,255,0)"); g.fillStyle = r; g.fillRect(0, 0, 64, 64); })(dustTex.getContext());
+dustTex.hasAlpha = true; dustTex.update();
+function makeDust(r) {
+  const ps = new BABYLON.ParticleSystem(r.name + "dust", 400, scene);
+  ps.particleTexture = dustTex;
+  ps.emitter = r.mount.position; // same Vector3 the rider moves, so the dust follows
+  ps.minEmitBox = V3(-0.35, 0, -0.9); ps.maxEmitBox = V3(0.35, 0.12, 0.6);
+  ps.direction1 = V3(-0.8, 0.5, -r.dir * 2.2); ps.direction2 = V3(0.8, 1.2, -r.dir * 0.6);
+  ps.minEmitPower = 0.4; ps.maxEmitPower = 1.2;
+  ps.minLifeTime = 0.8; ps.maxLifeTime = 2.0;
+  ps.minSize = 0.35; ps.maxSize = 1.3;
+  ps.color1 = new BABYLON.Color4(0.78, 0.68, 0.52, 0.32); ps.color2 = new BABYLON.Color4(0.7, 0.6, 0.45, 0.22);
+  ps.colorDead = new BABYLON.Color4(0.7, 0.6, 0.45, 0);
+  ps.gravity = V3(0, 0.08, 0); ps.minAngularSpeed = -0.5; ps.maxAngularSpeed = 0.5;
+  ps.blendMode = BABYLON.ParticleSystem.BLENDMODE_STANDARD;
+  ps.emitRate = 0; ps.start();
+  return ps;
+}
+Promise.all(["assets/horse.glb", "assets/knight.glb"].map(u => BABYLON.SceneLoader.LoadAssetContainerAsync("", u, scene)))
+.then(([horseC, knightC]) => {
+  for (const r of riders) {
+    const inst = horseC.instantiateModelsToScene(n => r.name + n, true, { doNotInstantiate: true });
+    const root = inst.rootNodes[0];
+    root.parent = r.horseHolder;
+    // Face +z in mount space whatever axis convention the exporter used: check where the head bone ended up
+    r.mount.computeWorldMatrix(true);
+    const headBone = root.getChildTransformNodes(false).find(n => n.name.toLowerCase().endsWith("head")); // names are prefixed per rider
+    headBone.computeWorldMatrix(true);
+    const headLocal = BABYLON.Vector3.TransformCoordinates(headBone.getAbsolutePosition(), r.mount.getWorldMatrix().clone().invert());
+    const faceY = headLocal.z < 0 ? Math.PI : 0;
+    r.horseHolder.rotation.y = faceY;
+    r.seatY = SEAT.y;
+    r.knight.position.set(0, r.seatY, SEAT.z);
+    // Coat: black for the player, dapple grey for the bot (as in the reference photos); mane and tail darker
+    const hide = new BABYLON.PBRMaterial(r.name + "hide", scene);
+    hide.albedoColor = r.dir > 0 ? C3(0.014, 0.011, 0.009) : C3(0.5, 0.5, 0.52); hide.metallic = 0; hide.roughness = 0.55;
+    weave(hide, "velour_velvet", 40, 40, 0.35);  // fine hair grain over the coat
+    if (r.dir < 0) { // dapple grey: soft light rounds ringed with darker grey, scattered over the coat
+      const dap = new BABYLON.DynamicTexture(r.name + "dapple", 512, scene, true), g = dap.getContext();
+      g.fillStyle = "rgb(150,150,154)"; g.fillRect(0, 0, 512, 512);
+      for (let i = 0; i < 260; i++) {
+        const x = Math.random() * 512, y = Math.random() * 512, rr = 8 + Math.random() * 16;
+        const grad = g.createRadialGradient(x, y, 0, x, y, rr);
+        grad.addColorStop(0, "rgba(215,215,218,0.95)"); grad.addColorStop(0.65, "rgba(195,195,198,0.6)");
+        grad.addColorStop(0.85, "rgba(110,110,115,0.5)"); grad.addColorStop(1, "rgba(150,150,154,0)");
+        g.fillStyle = grad; g.fillRect(x - rr, y - rr, rr * 2, rr * 2);
+      }
+      dap.update(); dap.uScale = dap.vScale = 3;
+      hide.albedoTexture = dap; hide.albedoColor = C3(1, 1, 1);
+    }
+    hide.sheen.isEnabled = true; hide.sheen.intensity = 0.35; hide.sheen.color = C3(0.9, 0.85, 0.8); // glossy coat
+    const hair = pbr(r.name + "hair", r.dir > 0 ? [0.006, 0.005, 0.004] : [0.08, 0.075, 0.07], 0, 0.85);
+    const tack = scanMat(r.name + "tackLeather", "brown_leather", [0.45, 0.32, 0.25], 0, 6, 6);
+    // Two looks from the references: player = black horse in caparison and cloth chanfron (photo 2);
+    // bot = grey horse shown bare, with bridle and studded peytral (photo 7)
+    const dressed = r.dir > 0, arms = dressed ? ARMS.player : ARMS.bot;
+    const chanfron = weave(pbr(r.name + "chanfron", BABYLON.Color3.FromHexString(arms.field).asArray(), 0, 0.85), "caban", 4, 4, 0.8);
+    for (const m of root.getChildMeshes(false)) {
+      if (/HorseBody/.test(m.name)) m.material = hide;
+      else if (/HorseHair/.test(m.name)) m.material = hair; // eyes, hooves, star and metal keep their Blender materials
+      else if (/HorseChanfron/.test(m.name)) { m.material = chanfron; m.isVisible = dressed; }
+      else if (m.material && /HorseTack$/.test(m.material.name)) m.material = tack;
+      shadows.addShadowCaster(m); m.receiveShadows = true;
+    }
+    r.dust = makeDust(r);
+    // Armour from Blender replaces the placeholder blocks; the torso stays as an invisible hit zone
+    for (const m of r.knight.getChildMeshes(true)) if (m !== r.torso) m.dispose();
+    r.torso.isVisible = false;
+    const kinst = knightC.instantiateModelsToScene(n => r.name + n, true, { doNotInstantiate: true });
+    const kroot = kinst.rootNodes[0];
+    const kholder = new BABYLON.TransformNode(r.name + "armour", scene);
+    kholder.parent = r.knight; kholder.rotation.y = faceY; kroot.parent = kholder;
+    r.armourHolder = kholder; r.leanSign = faceY ? -1 : 1; // pitch is applied before the yaw flip
+    r.armourMeshes = kroot.getChildMeshes(false);
+    // Scanned worn steel (scratches, polish variation) and leather on the armour
+    // steel colour is our own (the scan's colour map is painted plate); scratches + polish variation come from the scan
+    const steel = scanMat(r.name + "SteelScan", "metal_plate", [0.8, 0.8, 0.82], 1, 3, 3, false, 0.55);
+    const darkSteel = scanMat(r.name + "DarkSteelScan", "metal_plate", [0.08, 0.08, 0.09], 1, 3, 3, false, 0.8);
+    const leather = scanMat(r.name + "LeatherScan", "brown_leather", [0.9, 0.7, 0.6], 0, 3, 3);
+    for (const m of r.armourMeshes) {
+      const n = m.material ? m.material.name : "";
+      if (/DarkSteel/.test(n)) m.material = darkSteel;
+      else if (/Steel/.test(n)) m.material = steel;
+      else if (/Leather/.test(n)) m.material = leather;
+    }
+    for (const m of r.armourMeshes) { shadows.addShadowCaster(m); m.receiveShadows = true; }
+    r.bodyFlash = r.armourMeshes.find(m => m.material && /steel/i.test(m.material.name) && !/dark/i.test(m.material.name)) || r.armourMeshes[0];
+    // Caparison: heraldic cloth over the horse's body, dagged hem with a gold border
+    r.gallop = inst.animationGroups[0];
+    r.gallop.start(true); r.gallop.speedRatio = 0;
+    if (!dressed) continue;
+    const top = SEAT.y, bottom = 0.68;
+    const capa = makeCaparison(r.name, top, bottom);
+    capa.parent = r.mount;
+    capa.material = painted(r.name + "caparison", 1024, 256, (g, w, h) => {
+      g.clearRect(0, 0, w, h);
+      g.fillStyle = arms.field; g.fillRect(0, 0, w, h * 0.86);
+      for (let x = 0; x < w; x += 64) { g.beginPath(); g.moveTo(x, h * 0.86); g.lineTo(x + 32, h * 0.98); g.lineTo(x + 64, h * 0.86); g.fill(); } // dags
+      g.fillStyle = "#d9a521"; g.fillRect(0, h * 0.8, w, h * 0.035);
+      for (let x = 64; x < w; x += 256) { g.save(); g.translate(x, h * 0.12); drawArms(arms)(g, 110, 130); g.restore(); }
+    });
+    capa.material.albedoTexture.hasAlpha = true; capa.material.useAlphaFromAlbedoTexture = true;
+    capa.material.transparencyMode = BABYLON.Material.MATERIAL_ALPHATEST;
+    capa.material.albedoTexture.vScale = -1; // canvas row 0 = top of the cloth
+    weave(capa.material, "caban", 10, 2.5, 0.8); // heavy wool
+    shadows.addShadowCaster(capa); capa.receiveShadows = true;
+    r.capa = capa;
+  }
+  newMatch();
+}).catch(err => { hud.textContent = "Could not load horse: " + err.message; });
+
+scene.onBeforeRenderObservable.add(() => {
+  if (state === "loading") return;
+  const dt = Math.min(engine.getDeltaTime() / 1000, 0.05);
+
+  // Player pace: W/↑ to spur, S/↓ to rein in. Bot sets off once the player does.
+  if (state === "ready" || state === "riding") {
+    const accel = (keys.KeyW || keys.ArrowUp) ? 5 : (keys.KeyS || keys.ArrowDown) ? -8 : -0.6;
+    player.speed = BABYLON.Scalar.Clamp(player.speed + accel * dt, 0, MAX_SPEED);
+    if (state === "ready" && player.speed > 1) state = "riding";
+    if (state === "riding") bot.speed = Math.min(botTargetSpeed, bot.speed + 5 * dt);
+  } else {
+    for (const r of riders) r.speed = Math.max(0, r.speed - 10 * dt);
+  }
+
+  // Player lance: mouse steers across the tilt
+  player.yaw = -0.6 + aimX * 0.35;
+  player.pitch = 0.05 + aimY * 0.3;
+  if (state === "riding") botAim(dt);
+
+  // Guard: Space or right mouse for the player; the bot follows its per-pass plan
+  const riding = state === "riding";
+  player.wantGuard = riding && (keys.Space || rightMouse);
+  const tti = timeToImpact();
+  bot.wantGuard = riding && bot.guardAtTTI > 0 && tti < bot.guardAtTTI && tti > -0.3;
+  const now = performance.now() / 1000;
+  for (const r of riders) {
+    updateGuard(r, dt);
+    r.wobbleYaw = Math.sin(now * 13 + r.dir) * GUARD_WOBBLE * r.guard;
+    r.wobblePitch = Math.sin(now * 17 + r.dir * 2) * GUARD_WOBBLE * r.guard;
+  }
+
+  for (const r of riders) {
+    r.mount.position.z += r.dir * r.speed * dt;
+    if (r.dir * r.mount.position.z > TRACK_HALF) { r.mount.position.z = r.dir * TRACK_HALF; r.speed = 0; }
+    if (r.gallop) r.gallop.speedRatio = r.speed / 9;
+    r.pivot.rotation.y = r.yaw + r.wobbleYaw; r.pivot.rotation.x = r.pitch + r.wobblePitch;
+    r.recoil *= Math.max(0, 1 - dt * 4);
+    if (r.capa) flowCaparison(r.capa, r.speed / MAX_SPEED, now, r.speed);
+    if (r.dust) r.dust.emitRate = r.speed > 2 ? r.speed * 14 : 0;
+    // Hoofbeats: the same four-beat gallop as the animation (hind L, hind R, fore L, fore R), one sound per footfall
+    if (r.speed > 0.8) {
+      const prev = r.stride || 0, next = prev + dt * (r.speed / 9) / 0.667;
+      for (const o of [0, 0.12, 0.42, 0.54]) {
+        const a = prev % 1, b = next % 1, crossed = a <= b ? (a < o && o <= b) : (o > a || o <= b);
+        if (crossed) { const ear = earOf(r.mount.position); sfx.hoof(ear.vol * Math.min(1, r.speed / 6), ear.pan); }
+      }
+      r.stride = next;
+    }
+    // Rider's body: leans into the charge and rocks with the stride. Only the visible armour moves — the lance,
+    // shield and hit zones hang off r.knight, so aiming and scoring are unaffected.
+    if (r.armourHolder && !r.fall) {
+      const sp = r.speed / MAX_SPEED, ph = now * (3 + r.speed);
+      r.armourHolder.rotation.x = r.leanSign * (0.07 * sp + 0.03 * sp * Math.sin(ph + 0.6));
+      r.armourHolder.rotation.z = 0.02 * sp * Math.sin(ph * 0.5);
+    }
+    if (r.fall) updateFall(r, dt);
+    else {
+      r.knight.rotation.x = -r.recoil;
+      r.knight.position.y = r.seatY + Math.sin(performance.now() / 1000 * (4 + r.speed)) * 0.006 * r.speed / MAX_SPEED * 6;
+    }
+    r.mount.computeWorldMatrix(true); r.knight.computeWorldMatrix(true); r.pivot.computeWorldMatrix(true);
+    r.tip.computeWorldMatrix(true); r.shield.computeWorldMatrix(true); r.torso.computeWorldMatrix(true);
+  }
+
+  updateSplinters(dt);
+  if (state === "riding") {
+    resolveHit(player, bot); resolveHit(bot, player);
+    // A dismount ends the match at once (if both fall, the points decide)
+    if ((player.unhorsed || bot.unhorsed) && player.resolved && bot.resolved) {
+      state = "done";
+      const won = player.unhorsed && bot.unhorsed ? player.score > bot.score : bot.unhorsed;
+      say(`${bot.unhorsed && !player.unhorsed ? "You unhorsed your opponent!" : player.unhorsed && !bot.unhorsed ? "You were unhorsed!" : "Both knights unhorsed!"}\n${won ? "Victory" : "Defeat"} — press R for a rematch`, 0);
+    }
+    if (state === "riding" && player.resolved && bot.resolved && !player.announced) {
+      player.announced = true;
+      say(`You: ${player.lastResult}\nBot: ${bot.lastResult}`, 1800);
+    }
+    // Pass over when both riders are past each other and well down the lists
+    if (player.resolved && bot.resolved && player.mount.position.z > 25 && bot.mount.position.z < -25) {
+      player.announced = false;
+      if (pass >= PASSES && player.score !== bot.score) {
+        state = "done";
+        const won = player.score > bot.score;
+        say(`${won ? "Victory!" : "Defeat"}  ${player.score} – ${bot.score}\nPress R for a rematch`, 0);
+      } else { state = "between"; betweenT = 2.2; }
+    }
+  } else if (state === "between") {
+    betweenT -= dt;
+    if (betweenT <= 0) { pass++; resetPass(); }
+  }
+
+  // Sun's shadow box follows the player; banners flutter
+  sun.position = player.mount.position.subtract(sun.direction.scale(60));
+  for (const f of flags) f.rotation.y = Math.PI / 2 + Math.sin(now * 2.2 + f.phase) * 0.25;
+  // Crowd excitement: builds as the knights close on each other, spikes on a hit, then settles
+  const closing = state === "riding" ? Math.max(0, 1 - Math.abs(bot.mount.position.z - player.mount.position.z) / 35) : 0;
+  crowd.excite = Math.max(0, crowd.excite - dt * 0.35);
+  crowd.t = now; crowd.amp = 0.02 + 0.11 * Math.max(closing, crowd.excite);
+  sfx.crowd(Math.max(closing * 0.7, crowd.excite));
+
+  // Chase camera: low over the right shoulder, with a slight handheld sway that grows with the gallop
+  const want = player.mount.position.add(camOffset);
+  camera.position = BABYLON.Vector3.Lerp(camera.position, want, Math.min(1, dt * 4));
+  const sway = player.speed / MAX_SPEED;
+  camera.position.y += Math.sin(now * (3 + player.speed)) * 0.025 * sway;
+  camera.setTarget(player.mount.position.add(V3(-0.8 + Math.sin(now * 1.3) * 0.04 * sway, 2.0, 10)));
+
+  const passLabel = pass > PASSES ? `Extra pass ${pass - PASSES}` : `Pass ${pass} / ${PASSES}`;
+  scoreEl.textContent = `You ${player.score} — ${bot.score} Bot`;
+  const guardLabel = player.guardCooldown > 0 ? `tired (${player.guardCooldown.toFixed(1)}s)`
+    : player.guard > 0.8 ? `UP (${(GUARD_MAX - player.guardHeld).toFixed(1)}s left)` : "ready";
+  hud.innerHTML = `<b>IRON LANCE</b> — ${passLabel}<br>W / ↑ spur &nbsp; S / ↓ rein in<br>Mouse: aim lance at the red shield<br>`
+    + `Space / right-click: raise shield (max ${GUARD_MAX}s)<br>Shield +1 · Body +2 · Guard blocks body hits<br>`
+    + `Centred hit at ≥ ${(BREAK_SPEED * 3.6).toFixed(0)} km/h breaks the lance +1<br>`
+    + `Dead-centre body hit at ≥ ${(DISMOUNT_SPEED * 3.6).toFixed(0)} km/h unhorses — instant win<br>`
+    + `M: sound on/off<br>`
+    + `Speed: ${(player.speed * 3.6).toFixed(0)} km/h &nbsp; Shield: <b>${guardLabel}</b>`
+    + (state === "ready" ? "<br><b>Press W to charge</b>" : "");
+});
+
+engine.runRenderLoop(() => scene.render());
+addEventListener("resize", () => engine.resize());
+</script>
+</body>
+</html>

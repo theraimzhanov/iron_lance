@@ -1,0 +1,12 @@
+# OS / editor clutter
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Blender backups and Python caches
+*.blend1
+*.blend2
+__pycache__/
+
+# Local-only Claude settings
+.claude/settings.local.json
