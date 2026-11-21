@@ -9,7 +9,9 @@
   canvas { width: 100%; height: 100%; display: block; touch-action: none; }
   #hud { position: fixed; top: 12px; left: 12px; color: #f3e9d2; background: rgba(0,0,0,.45); padding: 10px 14px; border-radius: 8px; font-size: 14px; line-height: 1.5; pointer-events: none; }
   #score { position: fixed; top: 12px; right: 16px; color: #f3e9d2; font-size: 28px; font-weight: 800; text-shadow: 0 2px 8px #000; pointer-events: none; }
-  #msg { position: fixed; top: 22%; width: 100%; text-align: center; font-size: clamp(22px, 4vw, 44px); font-weight: 800; color: #ffd24a; text-shadow: 0 3px 12px #000; opacity: 0; transition: opacity .25s; pointer-events: none; white-space: pre-line; }
+  #credits { position: fixed; bottom: 6px; left: 8px; right: 8px; color: rgba(243,233,210,.75); font-size: 11px; text-shadow: 0 1px 3px #000; }
+  #credits a { color: inherit; }
+  #msg { position: fixed; top: 38%; width: 100%; text-align: center; font-size: clamp(22px, 4vw, 44px); font-weight: 800; color: #ffd24a; text-shadow: 0 3px 12px #000; opacity: 0; transition: opacity .25s; pointer-events: none; white-space: pre-line; }
 </style>
 </head>
 <body>
@@ -17,11 +19,16 @@
 <div id="hud">Loading horses…</div>
 <div id="score"></div>
 <div id="msg"></div>
+<div id="credits">Horse: <a href="https://sketchfab.com/3d-models/horse-run-cycle-on-place-8451f03cb1564436bfaa3964dd619a86" target="_blank" rel="noopener">"Horse Run Cycle On Place"</a> by Amitesh Nandan, <a href="http://creativecommons.org/licenses/by-nd/4.0/" target="_blank" rel="noopener">CC BY-ND 4.0</a> ·
+Knight: based on <a href="https://sketchfab.com/3d-models/armored-guard-knight-rig-b7bba7eddb13470b88eb8b24531cb6b3" target="_blank" rel="noopener">"Armored Guard Knight Rig"</a> by DM-913, <a href="http://creativecommons.org/licenses/by/4.0/" target="_blank" rel="noopener">CC BY 4.0</a> (posed, recoloured) ·
+Scans &amp; textures: <a href="https://polyhaven.com" target="_blank" rel="noopener">Poly Haven</a> CC0</div>
 <script src="https://cdn.jsdelivr.net/npm/babylonjs@9.30.0/babylon.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/babylonjs-loaders@9.30.0/babylonjs.loaders.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/earcut@2.2.4/dist/earcut.min.js"></script>
 <script>
-const LANE = 1.0, TRACK_HALF = 55, MAX_SPEED = 14, LANCE_LEN = 4.0, PASSES = 3;
+// Trial arena: ?arena=bloodfall swaps our arena for the Bloodfall pack (assets/bloodfall), whose tilt is 48 m long
+const BLOODFALL = new URLSearchParams(location.search).get("arena") === "bloodfall";
+const LANE = 1.0, TRACK_HALF = BLOODFALL ? 23 : 55, MAX_SPEED = 14, LANCE_LEN = 4.0, PASSES = 3;
 const BOT_AIM_ERROR = 0.28; // metres of aim scatter; lower = harder bot
 // Guard: raising the shield turns body hits (+2) into shield hits (+1), but the arm tires after
 // GUARD_MAX seconds and your own lance wobbles while guarding — so timing matters.
@@ -425,6 +432,7 @@ function waveFlag(f, now) {
 // --- Castle on a hill: assembled from a photoscanned stone fort kit (scripts/blender/assemble_castle.py),
 // with conical slate roofs and banners on its towers
 (function castle() {
+  if (BLOODFALL) return;
   const cx = -70, cz = 210, base = 7.5;
   const hill = BABYLON.MeshBuilder.CreateSphere("hill", { diameter: 1, segments: 24 }, scene);
   hill.scaling.set(150, 26, 110); hill.position.set(cx, -4, cz); hill.material = groundMat;
@@ -512,7 +520,7 @@ const PROP_LAYOUT = {
   boulder_01: [[-28, 60, 0.3, 1.5], [30, 10, 1.6, 1.2], [-22, -70, 2.2, 1.8]],
   curtain: [[0, 150, 0, 1]],  // photoscanned curtain wall + gatehouse tower closing the far end of the field
 };
-Object.entries(PROP_LAYOUT).forEach(([name, spots]) => {
+if (!BLOODFALL) Object.entries(PROP_LAYOUT).forEach(([name, spots]) => {
   if (!spots.length) return;
   BABYLON.SceneLoader.LoadAssetContainerAsync("assets/props/", name + ".glb", scene).then(c => {
     for (const [x, z, ry, s] of spots) {
@@ -599,7 +607,7 @@ function makeRider(name, laneX, dir, arms) {
   part(r.shieldMesh, heraldry, 0, 0, 0, r.shield);
   r.shieldMesh.rotation.z = -Math.PI / 2; // shape's +y face → facing outward (−x), point of the shield down
   // Lance: painted shaft, steel vamplate (hand guard) and a crown-shaped coronel tip
-  r.pivot = new BABYLON.TransformNode(name + "pivot", scene); r.pivot.parent = r.knight; r.pivot.position.set(0.3, 0.45, 0.1);
+  r.pivot = new BABYLON.TransformNode(name + "pivot", scene); r.pivot.parent = r.knight; r.pivot.position.set(0.3, 0.45, 0.1); // moved onto the rider's right fist once the model loads
   const lance = r.lance = BABYLON.MeshBuilder.CreateCylinder("lance", { diameterTop: 0.045, diameterBottom: 0.12, height: LANCE_LEN, tessellation: 12 }, scene);
   // Barber-pole spiral: diagonal bands wrap into a spiral round the shaft
   part(lance, painted(name + "lanceSpiral", 128, 128, (g, w, h) => {
@@ -607,7 +615,7 @@ function makeRider(name, laneX, dir, arms) {
     for (let k = -2; k < 3; k++) { g.beginPath(); g.moveTo(k * w, 0); g.lineTo(k * w + w * 0.5, 0); g.lineTo(k * w + w * 1.5, h); g.lineTo(k * w + w, h); g.fill(); }
   }, 1, 6), 0, 0, LANCE_LEN / 2 - 0.6, r.pivot);
   lance.rotation.x = Math.PI / 2;
-  const vamplate = part(BABYLON.MeshBuilder.CreateCylinder("vamplate", { diameterTop: 0.06, diameterBottom: 0.3, height: 0.28, tessellation: 20 }, scene), steel, 0, 0, 0.25, r.pivot);
+  const vamplate = part(BABYLON.MeshBuilder.CreateCylinder("vamplate", { diameterTop: 0.06, diameterBottom: 0.3, height: 0.28, tessellation: 20 }, scene), pbr(name + "forged", [0.55, 0.56, 0.58], 1, 0.5), 0, 0, 0.25, r.pivot); // duller than mirror steel, which picked up the trees' green
   vamplate.rotation.x = -Math.PI / 2;
   r.tip = part(BABYLON.MeshBuilder.CreateCylinder("coronel", { diameterTop: 0.11, diameterBottom: 0.05, height: 0.1, tessellation: 6 }, scene), darkSteel, 0, 0, LANCE_LEN - 0.6, r.pivot);
   r.tip.rotation.x = Math.PI / 2;
@@ -680,10 +688,10 @@ function autoQuality(now) { // average the frame rate over 3 s once loaded; only
   if (quality.fps.length > 180) {
     const avg = quality.fps.reduce((a, b) => a + b) / quality.fps.length;
     quality.fps.length = 0;
-    if (avg < 33) { setQuality(false); quality.auto = false; say("Graphics lowered for a smoother game — press Q to switch", 2500); }
+    if (avg < 33) { setQuality(false); quality.auto = false; say("Graphics lowered\n(Q to switch)", 2500); }
   }
 }
-const camOffset = new BABYLON.Vector3(1.9, 2.75, -5.2);
+const camOffset = new BABYLON.Vector3(2.0, 3.0, -6.6); // clears the real horse's hindquarters and tail
 
 // --- Sound: everything synthesised with Web Audio (no files). Browsers only allow audio after a key/click,
 // so the context starts on the first input. M toggles mute.
@@ -995,7 +1003,7 @@ function flowCaparison(mesh, sp, now, speed) {
 }
 
 // Horse and knight are built in Blender by scripts/blender/build_*.py (metres, seat at knight origin)
-const SEAT = { y: 1.6, z: 0.15 }, BODY = { z: -0.05, length: 1.62, width: 0.78 };
+const SEAT = { y: 1.62, z: 0.15 }, BODY = { z: -0.05, length: 1.62, width: 0.78 }, HORSE_BODY_SHIFT = -0.55; // head reaches far forward, so the bbox centre sits ahead of the saddle
 // Hoof dust: soft sand-coloured puffs thrown up behind each horse, more the faster it runs
 const dustTex = new BABYLON.DynamicTexture("dustTex", 64, scene, false);
 (g => { const r = g.createRadialGradient(32, 32, 2, 32, 32, 31); r.addColorStop(0, "rgba(255,255,255,0.9)"); r.addColorStop(1, "rgba(255,255,255,0)"); g.fillStyle = r; g.fillRect(0, 0, 64, 64); })(dustTex.getContext());
@@ -1041,52 +1049,54 @@ function makeDust(r) {
   ps.emitRate = 0; ps.start();
   return ps;
 }
-Promise.all(["assets/horse.glb", "assets/knight.glb"].map(u => BABYLON.SceneLoader.LoadAssetContainerAsync("", u, scene)))
+// Horse: "Horse Run Cycle On Place" by Amitesh Nandan (CC BY-ND 4.0) — loaded exactly as downloaded, since the
+// licence forbids distributing a modified copy; only its ground disc is hidden at runtime. Rider: build_rider.py.
+const HORSE_SCALE = 0.108, HORSE_STRIDE_SPEED = 12; // m/s at which its 0.5 s gallop cycle plays at normal speed
+if (BLOODFALL) { // hide everything of our arena (riders aren't loaded yet), then bring in the pack
+  for (const m of scene.meshes) if (!riders.some(r => m.isDescendantOf(r.mount) || m.isDescendantOf(r.knight))) m.setEnabled(false);
+  for (const ps of scene.particleSystems) ps.stop();
+  BABYLON.SceneLoader.LoadAssetContainerAsync("assets/bloodfall/", "Bloodfall_Arena.glb", scene).then(c => {
+    c.addAllToScene();
+    const root = c.rootNodes[0];
+    root.rotation = V3(0, Math.PI, 0); root.rotationQuaternion = null; // castle gate ahead of the player's charge
+    for (const m of root.getChildMeshes()) m.receiveShadows = true; // receive only: ~900k tris in the shadow map would cost too much
+    // Dusk like the pack's own render: braziers come in at Blender watts (~12000 cd), far too hot; cold dim sky light
+    for (const l of c.lights) l.intensity *= /Brazier/.test(l.name) ? 0.02 : 0.3;
+    sun.intensity = 1.1; sun.diffuse = C3(0.7, 0.8, 1.0);
+    scene.environmentIntensity = 0.35;
+    scene.fogColor = C3(0.16, 0.2, 0.3); scene.fogDensity = 0.006;
+    freezeStatic();
+  }).catch(e => { hud.textContent = "Could not load arena: " + e.message; });
+}
+Promise.all([["assets/sketchfab/horse/", "scene.gltf"], ["assets/", "rider.glb"]].map(([d, f]) => BABYLON.SceneLoader.LoadAssetContainerAsync(d, f, scene)))
 .then(([horseC, knightC]) => {
   for (const r of riders) {
     const inst = horseC.instantiateModelsToScene(n => r.name + n, true, { doNotInstantiate: true });
     const root = inst.rootNodes[0];
     root.parent = r.horseHolder;
-    // Face +z in mount space whatever axis convention the exporter used: check where the head bone ended up
-    r.mount.computeWorldMatrix(true);
-    const headBone = root.getChildTransformNodes(false).find(n => n.name.toLowerCase().endsWith("head")); // names are prefixed per rider
-    headBone.computeWorldMatrix(true);
-    const headLocal = BABYLON.Vector3.TransformCoordinates(headBone.getAbsolutePosition(), r.mount.getWorldMatrix().clone().invert());
-    const faceY = headLocal.z < 0 ? Math.PI : 0;
-    r.horseHolder.rotation.y = faceY;
-    r.seatY = SEAT.y;
-    r.knight.position.set(0, r.seatY, SEAT.z);
-    // Coat: black for the player, dapple grey for the bot (as in the reference photos); mane and tail darker
-    const hide = new BABYLON.PBRMaterial(r.name + "hide", scene);
-    hide.albedoColor = r.dir > 0 ? C3(0.014, 0.011, 0.009) : C3(0.5, 0.5, 0.52); hide.metallic = 0; hide.roughness = 0.55;
-    weave(hide, "velour_velvet", 40, 40, 0.35);  // fine hair grain over the coat
-    if (r.dir < 0) { // dapple grey: soft light rounds ringed with darker grey, scattered over the coat
-      const dap = new BABYLON.DynamicTexture(r.name + "dapple", 512, scene, true), g = dap.getContext();
-      g.fillStyle = "rgb(150,150,154)"; g.fillRect(0, 0, 512, 512);
-      for (let i = 0; i < 260; i++) {
-        const x = Math.random() * 512, y = Math.random() * 512, rr = 8 + Math.random() * 16;
-        const grad = g.createRadialGradient(x, y, 0, x, y, rr);
-        grad.addColorStop(0, "rgba(215,215,218,0.95)"); grad.addColorStop(0.65, "rgba(195,195,198,0.6)");
-        grad.addColorStop(0.85, "rgba(110,110,115,0.5)"); grad.addColorStop(1, "rgba(150,150,154,0)");
-        g.fillStyle = grad; g.fillRect(x - rr, y - rr, rr * 2, rr * 2);
-      }
-      dap.update(); dap.uScale = dap.vScale = 3;
-      hide.albedoTexture = dap; hide.albedoColor = C3(1, 1, 1);
-    }
-    hide.sheen.isEnabled = true; hide.sheen.intensity = 0.35; hide.sheen.color = C3(0.9, 0.85, 0.8); // glossy coat
-    const hair = pbr(r.name + "hair", r.dir > 0 ? [0.006, 0.005, 0.004] : [0.08, 0.075, 0.07], 0, 0.85);
-    const tack = scanMat(r.name + "tackLeather", "brown_leather", [0.45, 0.32, 0.25], 0, 6, 6);
-    // Two looks from the references: player = black horse in caparison and cloth chanfron (photo 2);
-    // bot = grey horse shown bare, with bridle and studded peytral (photo 7)
-    const dressed = r.dir > 0, arms = dressed ? ARMS.player : ARMS.bot;
-    const chanfron = weave(pbr(r.name + "chanfron", BABYLON.Color3.FromHexString(arms.field).asArray(), 0, 0.85), "caban", 4, 4, 0.8);
+    r.horseHolder.scaling.setAll(HORSE_SCALE); r.horseHolder.position.y = -0.15 * HORSE_SCALE;
+    const body = root.getChildMeshes(false).find(m => /polySurface/.test(m.name));
     for (const m of root.getChildMeshes(false)) {
-      if (/HorseBody/.test(m.name)) m.material = hide;
-      else if (/HorseHair/.test(m.name)) m.material = hair; // eyes, hooves, star and metal keep their Blender materials
-      else if (/HorseChanfron/.test(m.name)) { m.material = chanfron; m.isVisible = dressed; }
-      else if (m.material && /HorseTack$/.test(m.material.name)) m.material = tack;
+      if (/pDisc/.test(m.name)) { m.setEnabled(false); continue; }
       shadows.addShadowCaster(m); m.receiveShadows = true;
     }
+    // Face the head (its highest point) toward the mount's +z, and centre the body under the saddle
+    r.mount.computeWorldMatrix(true); r.horseHolder.computeWorldMatrix(true); body.computeWorldMatrix(true);
+    const toMount = r.mount.getWorldMatrix().clone().invert(), p = body.getVerticesData(BABYLON.VertexBuffer.PositionKind);
+    let head = null, lo = V3(1e9, 1e9, 1e9), hi = V3(-1e9, -1e9, -1e9);
+    for (let i = 0; i < p.length; i += 3) {
+      const v = BABYLON.Vector3.TransformCoordinates(V3(p[i], p[i + 1], p[i + 2]), body.getWorldMatrix().multiply(toMount));
+      lo.minimizeInPlace(v); hi.maximizeInPlace(v); if (!head || v.y > head.y) head = v;
+    }
+    const mid = lo.add(hi).scale(0.5), along = Math.abs(head.x - mid.x) > Math.abs(head.z - mid.z) ? head.x - mid.x : null;
+    r.horseHolder.rotation.y = along !== null ? (along > 0 ? -Math.PI / 2 : Math.PI / 2) : (head.z < mid.z ? Math.PI : 0);
+    r.horseHolder.computeWorldMatrix(true);
+    const c = BABYLON.Vector3.TransformCoordinates(body.getBoundingInfo().boundingBox.centerWorld, toMount);
+    r.horseHolder.position.x -= c.x; r.horseHolder.position.z -= c.z - HORSE_BODY_SHIFT;
+    const faceY = Math.PI; // Blender-built rider faces +Y, which lands as -z in the game
+    r.seatY = SEAT.y;
+    r.knight.position.set(0, r.seatY, SEAT.z);
+    const dressed = r.dir > 0, arms = dressed ? ARMS.player : ARMS.bot; // player's horse wears the caparison
     r.dust = makeDust(r);
     // Armour from Blender replaces the placeholder blocks; the torso stays as an invisible hit zone
     for (const m of r.knight.getChildMeshes(true)) if (m !== r.torso) m.dispose();
@@ -1097,6 +1107,27 @@ Promise.all(["assets/horse.glb", "assets/knight.glb"].map(u => BABYLON.SceneLoad
     kholder.parent = r.knight; kholder.rotation.y = faceY; kroot.parent = kholder;
     r.armourHolder = kholder; r.leanSign = faceY ? -1 : 1; // pitch is applied before the yaw flip
     r.armourMeshes = kroot.getChildMeshes(false);
+    // Lance grip and shield follow the rider's fists, read from the GripR/GripL markers build_rider.py exports
+    const toKnight = r.knight.getWorldMatrix().clone().invert();
+    const fist = n => { const t = kroot.getChildTransformNodes(false).find(x => x.name.endsWith(n)); t.computeWorldMatrix(true);
+                        return BABYLON.Vector3.TransformCoordinates(t.getAbsolutePosition(), toKnight); };
+    r.knight.computeWorldMatrix(true); kholder.computeWorldMatrix(true);
+    r.pivot.position.copyFrom(fist("GripR"));
+    const gl = fist("GripL"); // shield strapped to the outside of the left forearm, raised a little
+    Object.assign(SHIELD_REST, { x: gl.x - 0.12, y: gl.y + 0.12, z: gl.z });
+    // Crest: a fan of ostrich feathers in the rider's colours on top of the helm. Lives in the armour holder,
+    // where the rider faces -z, so +z is backward and rotation.x > 0 sweeps the feathers back.
+    const crestNode = kroot.getChildTransformNodes(false).find(x => x.name.endsWith("Crest"));
+    crestNode.computeWorldMatrix(true);
+    r.plume = new BABYLON.TransformNode(r.name + "plume", scene); r.plume.parent = kholder;
+    r.plume.position = BABYLON.Vector3.TransformCoordinates(crestNode.getAbsolutePosition(), kholder.getWorldMatrix().clone().invert());
+    const featherMats = [arms.field, arms.charge].map((c, i) => pbr(r.name + "feather" + i, BABYLON.Color3.FromHexString(c).asArray(), 0, 0.9));
+    [-0.08, -0.03, 0.03, 0.08, 0].forEach((sx, i) => {
+      const f = BABYLON.MeshBuilder.CreateSphere(r.name + "feather", { diameter: 1, segments: 8 }, scene);
+      f.scaling.set(0.1, 0.48 - Math.abs(sx) * 1.4, 0.07); f.position.set(sx * 1.3, 0.22, 0.08);
+      f.rotation.set(0.5, 0, sx * 2.5); f.parent = r.plume; f.material = featherMats[i % 2];
+      shadows.addShadowCaster(f);
+    });
     // Scanned worn steel (scratches, polish variation) and leather on the armour
     // steel colour is our own (the scan's colour map is painted plate); scratches + polish variation come from the scan
     const steel = scanMat(r.name + "SteelScan", "metal_plate", [0.8, 0.8, 0.82], 1, 3, 3, false, 0.55);
@@ -1113,7 +1144,6 @@ Promise.all(["assets/horse.glb", "assets/knight.glb"].map(u => BABYLON.SceneLoad
     // Caparison: heraldic cloth over the horse's body, dagged hem with a gold border
     r.gallop = inst.animationGroups[0];
     r.gallop.start(true); r.gallop.speedRatio = 0;
-    if (!dressed) continue;
     const top = SEAT.y, bottom = 0.68;
     const capa = makeCaparison(r.name, top, bottom);
     capa.parent = r.mount;
@@ -1134,9 +1164,14 @@ Promise.all(["assets/horse.glb", "assets/knight.glb"].map(u => BABYLON.SceneLoad
   newMatch();
 }).catch(err => { hud.textContent = "Could not load horse: " + err.message; });
 
+const slowmo = { t: 0, clock: 0 };
 scene.onBeforeRenderObservable.add(() => {
   if (state === "loading") return;
-  const dt = Math.min(engine.getDeltaTime() / 1000, 0.05);
+  // Slow motion after a hit: game time runs at 22% for ~1.1 real seconds
+  const realDt = Math.min(engine.getDeltaTime() / 1000, 0.05);
+  const timeScale = slowmo.t > 0 ? 0.22 : 1;
+  slowmo.t = Math.max(0, slowmo.t - realDt);
+  const dt = realDt * timeScale;
 
   // Player pace: W/↑ to spur, S/↓ to rein in. Bot sets off once the player does.
   if (state === "ready" || state === "riding") {
@@ -1158,7 +1193,7 @@ scene.onBeforeRenderObservable.add(() => {
   player.wantGuard = riding && (keys.Space || rightMouse);
   const tti = timeToImpact();
   bot.wantGuard = riding && bot.guardAtTTI > 0 && tti < bot.guardAtTTI && tti > -0.3;
-  const now = performance.now() / 1000;
+  const now = (slowmo.clock += dt); // game clock: everything animated from it slows down in the replay too
   for (const r of riders) {
     updateGuard(r, dt);
     r.wobbleYaw = Math.sin(now * 13 + r.dir) * GUARD_WOBBLE * r.guard;
@@ -1168,14 +1203,15 @@ scene.onBeforeRenderObservable.add(() => {
   for (const r of riders) {
     r.mount.position.z += r.dir * r.speed * dt;
     if (r.dir * r.mount.position.z > TRACK_HALF) { r.mount.position.z = r.dir * TRACK_HALF; r.speed = 0; }
-    if (r.gallop) r.gallop.speedRatio = r.speed / 9;
+    if (r.gallop) r.gallop.speedRatio = r.speed / HORSE_STRIDE_SPEED * timeScale;
+    if (r.dust) r.dust.updateSpeed = 0.01 * timeScale;
     r.pivot.rotation.y = r.yaw + r.wobbleYaw; r.pivot.rotation.x = r.pitch + r.wobblePitch;
     r.recoil *= Math.max(0, 1 - dt * 4);
     if (r.capa) flowCaparison(r.capa, r.speed / MAX_SPEED, now, r.speed);
     if (r.dust) r.dust.emitRate = r.speed > 2 ? r.speed * 14 : 0;
     // Hoofbeats: the same four-beat gallop as the animation (hind L, hind R, fore L, fore R), one sound per footfall
     if (r.speed > 0.8) {
-      const prev = r.stride || 0, next = prev + dt * (r.speed / 9) / 0.667;
+      const prev = r.stride || 0, next = prev + dt * (r.speed / HORSE_STRIDE_SPEED) / 0.5;
       for (const o of [0, 0.12, 0.42, 0.54]) {
         const a = prev % 1, b = next % 1, crossed = a <= b ? (a < o && o <= b) : (o > a || o <= b);
         if (crossed) { const ear = earOf(r.mount.position); sfx.hoof(ear.vol * Math.min(1, r.speed / 6), ear.pan); }
@@ -1189,10 +1225,11 @@ scene.onBeforeRenderObservable.add(() => {
       r.armourHolder.rotation.x = r.leanSign * (0.07 * sp + 0.03 * sp * Math.sin(ph + 0.6));
       r.armourHolder.rotation.z = 0.02 * sp * Math.sin(ph * 0.5);
     }
+    if (r.plume) r.plume.rotation.x = 0.55 * (r.speed / MAX_SPEED) + 0.12 * (r.speed / MAX_SPEED) * Math.sin(now * (6 + r.speed)); // streams back in the wind
     if (r.fall) updateFall(r, dt);
     else {
       r.knight.rotation.x = -r.recoil;
-      r.knight.position.y = r.seatY + Math.sin(performance.now() / 1000 * (4 + r.speed)) * 0.006 * r.speed / MAX_SPEED * 6;
+      r.knight.position.y = r.seatY + Math.sin(now * (4 + r.speed)) * 0.006 * r.speed / MAX_SPEED * 6;
     }
     r.mount.computeWorldMatrix(true); r.knight.computeWorldMatrix(true); r.pivot.computeWorldMatrix(true);
     r.tip.computeWorldMatrix(true); r.shield.computeWorldMatrix(true); r.torso.computeWorldMatrix(true);
@@ -1200,7 +1237,11 @@ scene.onBeforeRenderObservable.add(() => {
 
   updateSplinters(dt);
   if (state === "riding") {
+    const wasResolved = player.resolved && bot.resolved;
     resolveHit(player, bot); resolveHit(bot, player);
+    if (!wasResolved && player.resolved && bot.resolved && (player.lastResult !== "Miss" || bot.lastResult !== "Miss")) {
+      slowmo.t = 1.1; // the crossing just produced a hit: replay it side-on in slow motion
+    }
     // A dismount ends the match at once (if both fall, the points decide)
     if ((player.unhorsed || bot.unhorsed) && player.resolved && bot.resolved) {
       state = "done";
@@ -1212,7 +1253,7 @@ scene.onBeforeRenderObservable.add(() => {
       say(`You: ${player.lastResult}\nBot: ${bot.lastResult}`, 1800);
     }
     // Pass over when both riders are past each other and well down the lists
-    if (player.resolved && bot.resolved && player.mount.position.z > 25 && bot.mount.position.z < -25) {
+    if (player.resolved && bot.resolved && player.mount.position.z > TRACK_HALF * 0.45 && bot.mount.position.z < -TRACK_HALF * 0.45) {
       player.announced = false;
       if (pass >= PASSES && player.score !== bot.score) {
         state = "done";
@@ -1236,24 +1277,34 @@ scene.onBeforeRenderObservable.add(() => {
   crowd.t = now; crowd.amp = 0.02 + 0.11 * Math.max(closing, crowd.excite);
   sfx.crowd(Math.max(closing * 0.7, crowd.excite));
 
+  if (slowmo.t > 0) { // side-on view of the clash from outside the player's lane; the chase cam eases back after
+    camera.position.copyFrom(player.mount.position.add(V3(6.5, 1.9, 0.6)));
+    camera.setTarget(player.mount.position.add(V3(-0.6, 1.8, 0)));
+  } else {
   // Chase camera: low over the right shoulder, with a slight handheld sway that grows with the gallop
   const want = player.mount.position.add(camOffset);
   camera.position = BABYLON.Vector3.Lerp(camera.position, want, Math.min(1, dt * 4));
   const sway = player.speed / MAX_SPEED;
   camera.position.y += Math.sin(now * (3 + player.speed)) * 0.025 * sway;
   camera.setTarget(player.mount.position.add(V3(-0.8 + Math.sin(now * 1.3) * 0.04 * sway, 2.0, 10)));
+  }
 
   const passLabel = pass > PASSES ? `Extra pass ${pass - PASSES}` : `Pass ${pass} / ${PASSES}`;
   scoreEl.textContent = `You ${player.score} — ${bot.score} Bot`;
   const guardLabel = player.guardCooldown > 0 ? `tired (${player.guardCooldown.toFixed(1)}s)`
     : player.guard > 0.8 ? `UP (${(GUARD_MAX - player.guardHeld).toFixed(1)}s left)` : "ready";
-  hud.innerHTML = `<b>IRON LANCE</b> — ${passLabel}<br>W / ↑ spur &nbsp; S / ↓ rein in<br>Mouse: aim lance at the red shield<br>`
-    + `Space / right-click: raise shield (max ${GUARD_MAX}s)<br>Shield +1 · Body +2 · Guard blocks body hits<br>`
-    + `Centred hit at ≥ ${(BREAK_SPEED * 3.6).toFixed(0)} km/h breaks the lance +1<br>`
-    + `Dead-centre body hit at ≥ ${(DISMOUNT_SPEED * 3.6).toFixed(0)} km/h unhorses — instant win<br>`
-    + `M: sound on/off &nbsp; Q: graphics ${quality.high ? "high" : "low"}<br>`
-    + `Speed: ${(player.speed * 3.6).toFixed(0)} km/h &nbsp; Shield: <b>${guardLabel}</b>`
-    + (state === "ready" ? "<br><b>Press W to charge</b>" : "");
+  // Compact status line while riding; the full rules only before the first charge of a match, or while H is held
+  const status = `<b>${passLabel}</b> · ${(player.speed * 3.6).toFixed(0)} km/h · Shield: <b>${guardLabel}</b>`;
+  const help = (state === "ready" && pass === 1) || keys.KeyH;
+  const html = help
+    ? `<b>IRON LANCE</b> — ${passLabel}<br>W / ↑ spur &nbsp; S / ↓ rein in<br>Mouse: aim lance at the red shield<br>`
+      + `Space / right-click: raise shield (max ${GUARD_MAX}s)<br>Shield +1 · Body +2 · Guard blocks body hits<br>`
+      + `Centred hit at ≥ ${(BREAK_SPEED * 3.6).toFixed(0)} km/h breaks the lance +1<br>`
+      + `Dead-centre body hit at ≥ ${(DISMOUNT_SPEED * 3.6).toFixed(0)} km/h unhorses — instant win<br>`
+      + `M: sound · Q: graphics ${quality.high ? "high" : "low"} · hold H: this help<br>` + status
+      + (state === "ready" ? "<br><b>Press W to charge</b>" : "")
+    : status + (state === "ready" ? " · <b>W to charge</b>" : "") + ` <span style="opacity:.6">· H help</span>`;
+  if (hud.innerHTML !== html) hud.innerHTML = html; // skip DOM writes when nothing changed
 });
 
 engine.runRenderLoop(() => scene.render());
